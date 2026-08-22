@@ -18,3 +18,7 @@ The exact visible palette is:
 Silhouette, posture, tail position, the single eye, and restrained timing carry
 the character. Do not reconstruct the cat from geometry or normalize individual
 frames.
+
+The live audition contains five faithful readings of this authority. Only the
+Authority candidate is currently packed into the runtime pet; the other four
+remain idle-only review candidates until one is explicitly selected.

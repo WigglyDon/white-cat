@@ -8,7 +8,7 @@ use crate::contract::{
     ANIMATION_RANGES, COLUMNS, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, PIXEL_SCALE, SOURCE_HEIGHT,
     SOURCE_WIDTH, resolve_state,
 };
-use crate::maps::{POSES, PixelMap};
+use crate::maps::{AUDITION_CANDIDATES, POSES, PixelMap};
 use crate::{Result, WhiteCatError};
 
 pub const PALETTE: [(char, [u8; 4]); 5] = [
@@ -215,6 +215,21 @@ pub fn validate_source_maps() -> Result<()> {
             }
         }
     }
+    if AUDITION_CANDIDATES.len() != 5 {
+        return Err(WhiteCatError::new(
+            "live audition must contain exactly five cat candidates",
+        ));
+    }
+    for candidate in AUDITION_CANDIDATES {
+        for name in candidate.poses {
+            if pose(name).is_none() {
+                return Err(WhiteCatError::new(format!(
+                    "audition candidate {} references unknown pose {name}",
+                    candidate.id
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -326,6 +341,15 @@ pub fn parse_maps_source(source: &str) -> Result<ParsedArtwork> {
             }
         }
     }
+    for candidate in AUDITION_CANDIDATES {
+        for name in candidate.poses {
+            if !poses.contains_key(name) {
+                return Err(WhiteCatError::new(format!(
+                    "live source is missing audition pose {name:?}"
+                )));
+            }
+        }
+    }
     Ok(ParsedArtwork { poses })
 }
 
@@ -396,6 +420,38 @@ mod tests {
             assert!(changed <= 6, "{name} changed {changed} pixels");
             assert_eq!(&variant[8..18], &neutral[8..18]);
             assert_eq!(&variant[20..24], &neutral[20..24]);
+        }
+    }
+
+    #[test]
+    fn audition_contains_five_stable_idle_cats() {
+        assert_eq!(AUDITION_CANDIDATES.len(), 5);
+        for candidate in AUDITION_CANDIDATES {
+            let neutral = pose(candidate.poses[0]).unwrap();
+            for name in candidate.poses {
+                let variant = pose(name).unwrap();
+                let changed = neutral
+                    .iter()
+                    .zip(variant)
+                    .flat_map(|(before, after)| before.bytes().zip(after.bytes()))
+                    .filter(|(before, after)| before != after)
+                    .count();
+                assert!(
+                    changed <= 6,
+                    "candidate {} pose {name} changed {changed} pixels",
+                    candidate.id
+                );
+                assert_eq!(
+                    &variant[20..24],
+                    &neutral[20..24],
+                    "candidate {} moved its planted feet in {name}",
+                    candidate.id
+                );
+                let lowest = variant
+                    .iter()
+                    .rposition(|row| row.bytes().any(|pixel| pixel != b'.'));
+                assert_eq!(lowest, Some(23), "candidate {} lost baseline", candidate.id);
+            }
         }
     }
 

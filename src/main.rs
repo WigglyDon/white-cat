@@ -8,7 +8,8 @@ use white_cat::contract::{
 };
 use white_cat::install::install_pet;
 use white_cat::manifest::generate;
-use white_cat::preview::{render_plain, render_terminal, run_live};
+use white_cat::maps::AUDITION_CANDIDATES;
+use white_cat::preview::{render_plain, run_live, run_preview};
 use white_cat::validate::validate_project;
 use white_cat::{Result, WhiteCatError};
 
@@ -19,11 +20,13 @@ fn project_root() -> PathBuf {
 fn usage() {
     eprintln!(
         "White Cat pure-Rust toolchain\n\n\
-         usage: white-cat <command> [options]\n\n\
+         usage:\n\
+         white-cat                    launch live viewer (default)\n\
+         white-cat [<command>] [options]\n\n\
          commands:\n\
            status                         show scaffold/runtime state\n\
            preview [--state S] [--frame N] [--plain]\n\
-           live [--state S] [--source PATH]\n\
+           live [--candidate N] [--source PATH]\n\
            generate [--project-dir PATH]\n\
            validate [--project-dir PATH] [--no-source-check]\n\
            install [--project-dir PATH] [--force]"
@@ -73,9 +76,39 @@ fn command_status() {
     println!(
         "White Cat source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} Rust string arrays at fixed {PIXEL_SCALE}x scale"
     );
+    println!(
+        "White Cat live audition: {} candidates with 8 idle variations each",
+        AUDITION_CANDIDATES.len()
+    );
 }
 
-fn command_preview(args: &[String], live: bool) -> Result<()> {
+fn command_live(args: &[String]) -> Result<()> {
+    let mut source = project_root().join("src/maps.rs");
+    let mut candidate = 1_usize;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--source" => source = PathBuf::from(value_after(args, &mut index, "--source")?),
+            "--candidate" => {
+                let value = value_after(args, &mut index, "--candidate")?;
+                candidate = value.parse().map_err(|_| {
+                    WhiteCatError::new(format!("--candidate must be an integer: {value}"))
+                })?;
+                if !(1..=AUDITION_CANDIDATES.len()).contains(&candidate) {
+                    return Err(WhiteCatError::new(format!(
+                        "--candidate must be between 1 and {}",
+                        AUDITION_CANDIDATES.len()
+                    )));
+                }
+            }
+            option => return Err(WhiteCatError::new(format!("unknown option {option:?}"))),
+        }
+        index += 1;
+    }
+    run_live(&source, candidate - 1)
+}
+
+fn command_preview(args: &[String]) -> Result<()> {
     let mut source = project_root().join("src/maps.rs");
     let mut state = "idle".to_owned();
     let mut frame = 0_usize;
@@ -85,38 +118,36 @@ fn command_preview(args: &[String], live: bool) -> Result<()> {
         match args[index].as_str() {
             "--source" => source = PathBuf::from(value_after(args, &mut index, "--source")?),
             "--state" => state = value_after(args, &mut index, "--state")?,
-            "--frame" if !live => {
+            "--frame" => {
                 let value = value_after(args, &mut index, "--frame")?;
                 frame = value.parse().map_err(|_| {
                     WhiteCatError::new(format!("--frame must be a non-negative integer: {value}"))
                 })?;
             }
-            "--plain" if !live => plain = true,
+            "--plain" => plain = true,
             option => return Err(WhiteCatError::new(format!("unknown option {option:?}"))),
         }
         index += 1;
     }
 
-    if live {
-        run_live(&source, &state)
-    } else {
+    if plain {
         let artwork = white_cat::artwork::load_maps_source(&source)?;
-        let rendered = if plain {
-            render_plain(&artwork, &state, frame)?
-        } else {
-            render_terminal(&artwork, &state, frame, "static Rust source preview")?
-        };
+        let rendered = render_plain(&artwork, &state, frame)?;
         println!("{rendered}");
         Ok(())
+    } else {
+        run_preview(&source, &state, frame)
     }
 }
 
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let Some(command) = args.first().map(String::as_str) else {
-        usage();
-        return Err(WhiteCatError::new("missing command"));
+        return command_live(&[]);
     };
+    if command.starts_with("--") {
+        return command_live(&args);
+    }
     let options = &args[1..];
     match command {
         "status" => {
@@ -126,8 +157,8 @@ fn run() -> Result<()> {
             command_status();
             Ok(())
         }
-        "preview" => command_preview(options, false),
-        "live" => command_preview(options, true),
+        "preview" => command_preview(options),
+        "live" | "l" => command_live(options),
         "generate" => {
             let (project, _, _) = parse_project_dir(options, false)?;
             let (manifest, sheet) = generate(&project)?;
