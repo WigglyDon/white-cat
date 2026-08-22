@@ -1,0 +1,9 @@
+target/
+
+# Installer staging, local backups, and scratch output inside this project.
+.white-cat-install-*/
+white-cat.backup-*/
+*.tmp
+*.scratch
+
+# Static runtime assets and the approved visual authority remain trackable.
