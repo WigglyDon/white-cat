@@ -1,6 +1,8 @@
 pub mod artwork;
 pub mod contract;
+pub mod digest;
 pub mod error;
+pub mod evidence;
 pub mod install;
 pub mod kitten;
 pub mod manifest;

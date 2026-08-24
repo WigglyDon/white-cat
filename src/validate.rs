@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -9,191 +9,392 @@ use crate::artwork::{
     LIGHT_REVIEW_FILE, REVIEW_DIRECTORY, SILHOUETTE_REVIEW_FILE, SOURCE_REVIEW_FILE,
 };
 use crate::contract::{
-    ALIASES, EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_MARGIN,
-    FRAME_WIDTH, GRID_COLUMNS, GRID_ROWS, LAST_PLANTED_Y, MANIFEST_FILE, PET_ID, SHEET_FILE,
+    ALIASES, EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH,
+    GRID_COLUMNS, GRID_ROWS, GROUND_Y, LAST_PLANTED_Y, MANIFEST_FILE, PET_ID, SHEET_FILE,
     SHEET_HEIGHT, SHEET_WIDTH, STATES, state_named,
 };
-use crate::error::{Result, fail};
-use crate::kitten::{self, EYE, FUR, OUTLINE, SHADOW};
+use crate::digest::sha256_hex;
+use crate::error::{Result, WhiteCatError, fail};
+use crate::evidence;
+use crate::kitten;
 use crate::manifest::{self, PetManifest};
 use crate::sheet;
+
+pub const SHEET_RGBA_SHA256: &str =
+    "fa797cfe00ce23809d1b22daf68b0c9faa5b2062a599af4d5a83728bbf0ee754";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValidationReport {
+    pub source_mismatches: usize,
+    pub runtime_mismatches: usize,
+    pub reconstructed_source_mismatches: usize,
+    pub nonuniform_logical_blocks: usize,
+    pub illegal_source_symbols: usize,
+    pub illegal_runtime_colors: usize,
+    pub alpha_violations: usize,
+    pub frame_to_frame_mismatches: usize,
+    pub logical_blocks_checked: usize,
+    pub frames_checked: usize,
+    pub normalized_matrix_sha256: String,
+    pub contiguous_symbol_sha256: String,
+    pub logical_rgba_sha256: String,
+    pub runtime_rgba_sha256: String,
+    pub sheet_rgba_sha256: String,
+}
+
+impl ValidationReport {
+    pub fn summary_tsv(&self) -> String {
+        format!(
+            concat!(
+                "check\tvalue\n",
+                "source_mismatches\t{}\n",
+                "runtime_mismatches\t{}\n",
+                "reconstructed_source_mismatches\t{}\n",
+                "nonuniform_logical_blocks\t{}\n",
+                "illegal_source_symbols\t{}\n",
+                "illegal_runtime_colors\t{}\n",
+                "alpha_violations\t{}\n",
+                "frame_to_frame_mismatches\t{}\n",
+                "logical_blocks_checked\t{}\n",
+                "frames_checked\t{}\n",
+                "normalized_matrix_sha256\t{}\n",
+                "contiguous_symbol_sha256\t{}\n",
+                "logical_rgba_sha256\t{}\n",
+                "runtime_rgba_sha256\t{}\n",
+                "sheet_rgba_sha256\t{}\n"
+            ),
+            self.source_mismatches,
+            self.runtime_mismatches,
+            self.reconstructed_source_mismatches,
+            self.nonuniform_logical_blocks,
+            self.illegal_source_symbols,
+            self.illegal_runtime_colors,
+            self.alpha_violations,
+            self.frame_to_frame_mismatches,
+            self.logical_blocks_checked,
+            self.frames_checked,
+            self.normalized_matrix_sha256,
+            self.contiguous_symbol_sha256,
+            self.logical_rgba_sha256,
+            self.runtime_rgba_sha256,
+            self.sheet_rgba_sha256,
+        )
+    }
+}
 
 fn ensure(condition: bool, message: impl Into<String>) -> Result<()> {
     if condition { Ok(()) } else { fail(message) }
 }
 
-fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
-    let mut min_x = image.width();
-    let mut min_y = image.height();
-    let mut max_x = 0;
-    let mut max_y = 0;
-    let mut found = false;
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[3] > 8 {
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
-            found = true;
-        }
-    }
-    found.then_some((min_x, min_y, max_x, max_y))
-}
-
-fn color_distance(pixel: &[u8; 4], color: [u8; 4]) -> u32 {
-    (0..3)
-        .map(|channel| {
-            let difference = i32::from(pixel[channel]) - i32::from(color[channel]);
-            (difference * difference) as u32
-        })
-        .sum()
-}
-
-fn validate_concept_cell_centers(frame: &RgbaImage) -> Result<()> {
-    for logical_y in 0..kitten::LOGICAL_HEIGHT {
-        for logical_x in 0..kitten::LOGICAL_WIDTH {
-            let symbol = kitten::canonical_symbol(logical_x, logical_y)
-                .ok_or_else(|| crate::error::WhiteCatError::new("canonical map is incomplete"))?;
-            let expected = kitten::palette_color(symbol).ok_or_else(|| {
-                crate::error::WhiteCatError::new(format!(
-                    "canonical map uses unknown symbol {symbol:?}"
-                ))
-            })?;
-            let x = logical_x as u32 * kitten::RUNTIME_PIXEL_SIZE + kitten::RUNTIME_PIXEL_SIZE / 2;
-            let y = logical_y as u32 * kitten::RUNTIME_PIXEL_SIZE + kitten::RUNTIME_PIXEL_SIZE / 2;
-            let actual = frame.get_pixel(x, y).0;
-            ensure(
-                actual == expected,
-                format!(
-                    "concept cell ({logical_x},{logical_y}) {symbol:?} rendered as {actual:?}, expected {expected:?}"
-                ),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_connected_silhouette(frame: &RgbaImage) -> Result<()> {
-    let occupied: HashSet<(u32, u32)> = frame
-        .enumerate_pixels()
-        .filter(|(_, _, pixel)| pixel[3] >= 32)
-        .map(|(x, y, _)| (x, y))
-        .collect();
-    let start = *occupied
-        .iter()
-        .next()
-        .ok_or_else(|| crate::error::WhiteCatError::new("canonical frame is empty"))?;
-    let mut reached = HashSet::new();
-    let mut queue = VecDeque::from([start]);
-    while let Some((x, y)) = queue.pop_front() {
-        if !occupied.contains(&(x, y)) || !reached.insert((x, y)) {
-            continue;
-        }
-        if x > 0 {
-            queue.push_back((x - 1, y));
-        }
-        if x + 1 < frame.width() {
-            queue.push_back((x + 1, y));
-        }
-        if y > 0 {
-            queue.push_back((x, y - 1));
-        }
-        if y + 1 < frame.height() {
-            queue.push_back((x, y + 1));
-        }
-    }
-    ensure(
-        reached.len() == occupied.len(),
-        format!(
-            "silhouette has disconnected occupancy: reached {} of {} pixels",
-            reached.len(),
-            occupied.len()
-        ),
+pub fn rgba_hex(color: [u8; 4]) -> String {
+    format!(
+        "#{:02X}{:02X}{:02X}{:02X}",
+        color[0], color[1], color[2], color[3]
     )
 }
 
-pub fn validate_frame(frame: &RgbaImage) -> Result<()> {
+fn occupied_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (x, y, x, y),
+            Some((min_x, min_y, max_x, max_y)) => {
+                (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+            }
+        });
+    }
+    bounds
+}
+
+fn fail_with_details(label: &str, count: usize, details: &[String]) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let mut message = format!("{label}: mismatch count {count}");
+    for detail in details {
+        message.push('\n');
+        message.push_str(detail);
+    }
+    fail(message)
+}
+
+fn validate_source_contract(report: &mut ValidationReport) -> Result<()> {
+    ensure(
+        kitten::CANONICAL_MAP.len() == kitten::LOGICAL_HEIGHT,
+        format!(
+            "source row count is {}, expected {}",
+            kitten::CANONICAL_MAP.len(),
+            kitten::LOGICAL_HEIGHT
+        ),
+    )?;
+
+    let mut structural_details = Vec::new();
+    let mut counts: BTreeMap<char, usize> = BTreeMap::new();
+    for (y, row) in kitten::CANONICAL_MAP.iter().enumerate() {
+        if row.len() != kitten::LOGICAL_WIDTH {
+            structural_details.push(format!(
+                "logical row {y} width is {}, expected {}",
+                row.len(),
+                kitten::LOGICAL_WIDTH
+            ));
+        }
+        for (x, symbol) in row.chars().enumerate() {
+            if kitten::palette_color(symbol).is_none() {
+                report.illegal_source_symbols += 1;
+                structural_details.push(format!(
+                    "illegal source symbol {symbol:?} at logical ({x},{y})"
+                ));
+            } else {
+                *counts.entry(symbol).or_default() += 1;
+            }
+        }
+    }
+    fail_with_details(
+        "canonical source structure",
+        structural_details.len(),
+        &structural_details,
+    )?;
+
+    for (symbol, expected) in kitten::EXPECTED_SYMBOL_COUNTS {
+        let actual = counts.get(&symbol).copied().unwrap_or(0);
+        ensure(
+            actual == expected,
+            format!("source symbol {symbol:?} count is {actual}, expected {expected}"),
+        )?;
+    }
+    ensure(
+        counts.values().sum::<usize>() == kitten::LOGICAL_WIDTH * kitten::LOGICAL_HEIGHT,
+        "source symbol total is not 624",
+    )?;
+
+    let normalized = kitten::normalized_matrix_text();
+    let contiguous = kitten::contiguous_symbols();
+    ensure(
+        normalized.len() == kitten::NORMALIZED_MATRIX_BYTES,
+        format!(
+            "normalized matrix is {} bytes, expected {}",
+            normalized.len(),
+            kitten::NORMALIZED_MATRIX_BYTES
+        ),
+    )?;
+    ensure(
+        contiguous.len() == kitten::LOGICAL_WIDTH * kitten::LOGICAL_HEIGHT,
+        "contiguous symbol payload is not 624 bytes",
+    )?;
+    report.normalized_matrix_sha256 = sha256_hex(normalized.as_bytes());
+    report.contiguous_symbol_sha256 = sha256_hex(&contiguous);
+    ensure(
+        report.normalized_matrix_sha256 == kitten::NORMALIZED_MATRIX_SHA256,
+        format!(
+            "normalized matrix SHA-256 is {}, expected {}",
+            report.normalized_matrix_sha256,
+            kitten::NORMALIZED_MATRIX_SHA256
+        ),
+    )?;
+    ensure(
+        report.contiguous_symbol_sha256 == kitten::CONTIGUOUS_SYMBOL_SHA256,
+        format!(
+            "contiguous symbol SHA-256 is {}, expected {}",
+            report.contiguous_symbol_sha256,
+            kitten::CONTIGUOUS_SYMBOL_SHA256
+        ),
+    )?;
+
+    let logical = kitten::render_logical();
+    ensure(
+        logical.dimensions() == (kitten::LOGICAL_WIDTH as u32, kitten::LOGICAL_HEIGHT as u32),
+        "logical RGBA image is not 24x26",
+    )?;
+    ensure(
+        logical.as_raw().len() == kitten::LOGICAL_RGBA_BYTES,
+        "logical RGBA payload is not 2496 bytes",
+    )?;
+    let mut mismatch_details = Vec::new();
+    for (x, y, actual) in logical.enumerate_pixels() {
+        let symbol = kitten::canonical_symbol(x as usize, y as usize)
+            .ok_or_else(|| WhiteCatError::new(format!("missing source at logical ({x},{y})")))?;
+        let expected = kitten::palette_color(symbol).expect("validated source symbol");
+        if actual.0 != expected {
+            report.source_mismatches += 1;
+            mismatch_details.push(format!(
+                "logical ({x},{y}) expected {} actual {}",
+                rgba_hex(expected),
+                rgba_hex(actual.0)
+            ));
+        }
+        if !matches!(actual[3], 0 | 255) || (actual[3] == 0 && actual.0[..3] != [0, 0, 0]) {
+            report.alpha_violations += 1;
+            mismatch_details.push(format!(
+                "logical alpha violation at ({x},{y}) actual {}",
+                rgba_hex(actual.0)
+            ));
+        }
+    }
+    fail_with_details(
+        "logical source identity",
+        report.source_mismatches + report.alpha_violations,
+        &mismatch_details,
+    )?;
+    report.logical_rgba_sha256 = sha256_hex(logical.as_raw());
+    ensure(
+        report.logical_rgba_sha256 == kitten::LOGICAL_RGBA_SHA256,
+        format!(
+            "logical RGBA SHA-256 is {}, expected {}",
+            report.logical_rgba_sha256,
+            kitten::LOGICAL_RGBA_SHA256
+        ),
+    )?;
+    ensure(
+        occupied_bounds(&logical) == Some((0, 1, 23, 24)),
+        format!(
+            "logical occupied bounds are {:?}, expected (0,1)-(23,24)",
+            occupied_bounds(&logical)
+        ),
+    )?;
+    ensure(
+        kitten::CANONICAL_MAP[25] == "........................",
+        "logical row 25 is not entirely transparent",
+    )
+}
+
+pub fn validate_frame(frame: &RgbaImage) -> Result<ValidationReport> {
+    let mut report = ValidationReport::default();
+    validate_source_contract(&mut report)?;
     ensure(
         frame.dimensions() == (FRAME_WIDTH, FRAME_HEIGHT),
         format!(
-            "canonical frame is {}x{}, expected {FRAME_WIDTH}x{FRAME_HEIGHT}",
+            "runtime frame is {}x{}, expected {FRAME_WIDTH}x{FRAME_HEIGHT}",
             frame.width(),
             frame.height()
         ),
     )?;
-    let (min_x, min_y, max_x, max_y) = alpha_bounds(frame)
-        .ok_or_else(|| crate::error::WhiteCatError::new("canonical frame is empty"))?;
-    ensure(
-        min_x >= FRAME_MARGIN && min_y >= FRAME_MARGIN,
-        format!("frame begins at ({min_x},{min_y}), inside the {FRAME_MARGIN}px guard"),
+
+    let mut details = Vec::new();
+    let mut runtime_counts: BTreeMap<[u8; 4], usize> = BTreeMap::new();
+    for (x, y, actual) in frame.enumerate_pixels() {
+        *runtime_counts.entry(actual.0).or_default() += 1;
+        if !kitten::PALETTE.iter().any(|(_, color)| color == &actual.0) {
+            report.illegal_runtime_colors += 1;
+            details.push(format!(
+                "illegal runtime color at ({x},{y}) actual {}",
+                rgba_hex(actual.0)
+            ));
+        }
+        if !matches!(actual[3], 0 | 255) || (actual[3] == 0 && actual.0[..3] != [0, 0, 0]) {
+            report.alpha_violations += 1;
+            details.push(format!(
+                "runtime alpha violation at ({x},{y}) actual {}",
+                rgba_hex(actual.0)
+            ));
+        }
+        let logical_x = (x / kitten::RUNTIME_PIXEL_SIZE) as usize;
+        let logical_y = (y / kitten::RUNTIME_PIXEL_SIZE) as usize;
+        let symbol = kitten::canonical_symbol(logical_x, logical_y)
+            .expect("runtime coordinate maps inside canonical matrix");
+        let expected = kitten::palette_color(symbol).expect("validated source symbol");
+        if actual.0 != expected {
+            report.runtime_mismatches += 1;
+            details.push(format!(
+                "runtime ({x},{y}) logical ({logical_x},{logical_y}) expected {} actual {}",
+                rgba_hex(expected),
+                rgba_hex(actual.0)
+            ));
+        }
+    }
+
+    for logical_y in 0..kitten::LOGICAL_HEIGHT {
+        for logical_x in 0..kitten::LOGICAL_WIDTH {
+            report.logical_blocks_checked += 1;
+            let origin_x = logical_x as u32 * kitten::RUNTIME_PIXEL_SIZE;
+            let origin_y = logical_y as u32 * kitten::RUNTIME_PIXEL_SIZE;
+            let first = frame.get_pixel(origin_x, origin_y).0;
+            let symbol =
+                kitten::canonical_symbol(logical_x, logical_y).expect("complete canonical matrix");
+            let expected = kitten::palette_color(symbol).expect("validated source symbol");
+            let mut block_mismatches = 0usize;
+            for dy in 0..kitten::RUNTIME_PIXEL_SIZE {
+                for dx in 0..kitten::RUNTIME_PIXEL_SIZE {
+                    if frame.get_pixel(origin_x + dx, origin_y + dy).0 != first {
+                        block_mismatches += 1;
+                    }
+                }
+            }
+            if block_mismatches != 0 {
+                report.nonuniform_logical_blocks += 1;
+                details.push(format!(
+                    "nonuniform logical block ({logical_x},{logical_y}) runtime rectangle ({origin_x},{origin_y})-({},{}) mismatch count {block_mismatches}",
+                    origin_x + kitten::RUNTIME_PIXEL_SIZE - 1,
+                    origin_y + kitten::RUNTIME_PIXEL_SIZE - 1,
+                ));
+            }
+            if first != expected {
+                report.reconstructed_source_mismatches += 1;
+                details.push(format!(
+                    "reconstructed logical ({logical_x},{logical_y}) runtime rectangle ({origin_x},{origin_y})-({},{}) expected {} actual {}",
+                    origin_x + kitten::RUNTIME_PIXEL_SIZE - 1,
+                    origin_y + kitten::RUNTIME_PIXEL_SIZE - 1,
+                    rgba_hex(expected),
+                    rgba_hex(first),
+                ));
+            }
+        }
+    }
+    fail_with_details(
+        "runtime identity",
+        report.runtime_mismatches
+            + report.reconstructed_source_mismatches
+            + report.nonuniform_logical_blocks
+            + report.illegal_runtime_colors
+            + report.alpha_violations,
+        &details,
     )?;
-    ensure(
-        max_x + FRAME_MARGIN < FRAME_WIDTH,
-        format!("frame ends at x={max_x}, outside the production guard"),
-    )?;
-    ensure(
-        max_y == LAST_PLANTED_Y,
-        format!("last planted pixel is y={max_y}, expected {LAST_PLANTED_Y}"),
-    )?;
-    ensure(
-        (176..=182).contains(&(max_x - min_x + 1)),
-        format!(
-            "concept silhouette width {} is outside the faithful pixel range",
-            max_x - min_x + 1
-        ),
-    )?;
-    ensure(
-        (176..=182).contains(&(max_y - min_y + 1)),
-        format!(
-            "concept silhouette height {} is outside the faithful pixel range",
-            max_y - min_y + 1
-        ),
-    )?;
-    ensure(
-        frame
-            .enumerate_pixels()
-            .all(|(_, y, pixel)| y <= LAST_PLANTED_Y || pixel[3] == 0),
-        "pixels extend below the grounded boundary",
-    )?;
-    ensure(
-        frame
-            .enumerate_pixels()
-            .filter(|(_, _, pixel)| pixel[3] > 0 && pixel[3] < 255)
-            .count()
-            > 100,
-        "canonical frame has no meaningful antialiased edge coverage",
-    )?;
-    let eye_pixels = frame
-        .pixels()
-        .filter(|pixel| pixel[3] > 180 && color_distance(&pixel.0, EYE) < 500)
-        .count();
-    ensure(
-        (40..=90).contains(&eye_pixels),
-        format!("single concept eye area is {eye_pixels} pixels"),
-    )?;
-    for (name, color, minimum) in [
-        ("outline", OUTLINE, 500usize),
-        ("fur", FUR, 4_000usize),
-        ("shadow", SHADOW, 100usize),
-    ] {
-        let count = frame
-            .pixels()
-            .filter(|pixel| pixel[3] > 180 && color_distance(&pixel.0, color) < 500)
-            .count();
+
+    for (symbol, logical_count) in kitten::EXPECTED_SYMBOL_COUNTS {
+        let color = kitten::palette_color(symbol).expect("known palette symbol");
+        let expected = logical_count * (kitten::RUNTIME_PIXEL_SIZE as usize).pow(2);
+        let actual = runtime_counts.get(&color).copied().unwrap_or(0);
         ensure(
-            count >= minimum,
-            format!("concept {name} color has only {count} anchored pixels"),
+            actual == expected,
+            format!(
+                "runtime color {} count is {actual}, expected {expected}",
+                rgba_hex(color)
+            ),
         )?;
     }
     ensure(
-        (0..FRAME_WIDTH)
-            .filter(|x| frame.get_pixel(*x, LAST_PLANTED_Y)[3] > 8)
-            .count()
-            >= 100,
-        "ground contact is too narrow",
+        runtime_counts.values().sum::<usize>() == (FRAME_WIDTH * FRAME_HEIGHT) as usize,
+        "runtime pixel total is not 39936",
     )?;
-    validate_concept_cell_centers(frame)?;
-    validate_connected_silhouette(frame)
+    ensure(
+        occupied_bounds(frame) == Some((0, 8, 191, 199)),
+        format!(
+            "runtime occupied bounds are {:?}, expected (0,8)-(191,199)",
+            occupied_bounds(frame)
+        ),
+    )?;
+    ensure(
+        frame
+            .enumerate_pixels()
+            .all(|(_, y, pixel)| y < GROUND_Y || pixel.0 == kitten::TRANSPARENT),
+        format!("runtime pixels extend to or below GROUND_Y={GROUND_Y}"),
+    )?;
+    ensure(
+        LAST_PLANTED_Y == 199,
+        format!("last planted y is {LAST_PLANTED_Y}, expected 199"),
+    )?;
+    report.runtime_rgba_sha256 = sha256_hex(frame.as_raw());
+    ensure(
+        report.runtime_rgba_sha256 == kitten::RUNTIME_RGBA_SHA256,
+        format!(
+            "runtime RGBA SHA-256 is {}, expected {}",
+            report.runtime_rgba_sha256,
+            kitten::RUNTIME_RGBA_SHA256
+        ),
+    )?;
+    Ok(report)
 }
 
 pub fn validate_manifest(manifest: &PetManifest) -> Result<()> {
@@ -217,16 +418,18 @@ pub fn validate_manifest(manifest: &PetManifest) -> Result<()> {
         "manifest frame allocation count is unstable",
     )?;
     for state in STATES {
-        let allocation = manifest.frame_allocation.get(state.name).ok_or_else(|| {
-            crate::error::WhiteCatError::new(format!("missing state {}", state.name))
-        })?;
+        let allocation = manifest
+            .frame_allocation
+            .get(state.name)
+            .ok_or_else(|| WhiteCatError::new(format!("missing state {}", state.name)))?;
         ensure(
             allocation.start == state.start && allocation.end == state.end,
             format!("state {} has incorrect allocation", state.name),
         )?;
-        let animation = manifest.animations.get(state.name).ok_or_else(|| {
-            crate::error::WhiteCatError::new(format!("missing animation {}", state.name))
-        })?;
+        let animation = manifest
+            .animations
+            .get(state.name)
+            .ok_or_else(|| WhiteCatError::new(format!("missing animation {}", state.name)))?;
         ensure(
             animation.frames == [state.start]
                 && animation.fps == 1
@@ -237,9 +440,10 @@ pub fn validate_manifest(manifest: &PetManifest) -> Result<()> {
     }
     for (alias, target) in ALIASES {
         let expected = state_named(target).expect("known alias target");
-        let animation = manifest.animations.get(alias).ok_or_else(|| {
-            crate::error::WhiteCatError::new(format!("missing alias animation {alias}"))
-        })?;
+        let animation = manifest
+            .animations
+            .get(alias)
+            .ok_or_else(|| WhiteCatError::new(format!("missing alias animation {alias}")))?;
         ensure(
             animation.frames == [expected.start]
                 && animation.fps == 1
@@ -271,33 +475,33 @@ fn validate_reviews(project: &Path, frame: &RgbaImage) -> Result<()> {
         "70x15 review does not have exact terminal-cell geometry",
     )?;
     ensure(
-        source.dimensions() == (kitten::SOURCE_WIDTH, kitten::SOURCE_HEIGHT),
-        "source review is not the canonical 4x render",
+        source.dimensions() == (kitten::LOGICAL_WIDTH as u32, kitten::LOGICAL_HEIGHT as u32),
+        "source review is not the exact 24x26 canonical matrix",
     )?;
     ensure(
         silhouette.dimensions() == source.dimensions(),
-        "silhouette review does not match source dimensions",
+        "silhouette review does not match logical dimensions",
     )?;
     ensure(
-        source.as_raw() == kitten::render_source().as_raw(),
-        "source review differs from the canonical authored render",
+        source.as_raw() == kitten::render_logical().as_raw(),
+        "source review differs from the canonical matrix",
     )?;
     ensure(
-        silhouette.as_raw() == kitten::render_silhouette_source().as_raw(),
-        "silhouette review differs from the canonical occupancy mask",
+        silhouette.as_raw() == kitten::render_silhouette_logical().as_raw(),
+        "silhouette review differs from canonical occupancy",
     )?;
     ensure(
         dark.as_raw() == artwork::dark_review(frame).as_raw()
             && light.as_raw() == artwork::light_review(frame).as_raw()
             && exact.as_raw() == artwork::exact_70x15_review(frame).as_raw(),
         "prompt review artifacts are stale or nondeterministic",
-    )?;
-    Ok(())
+    )
 }
 
 fn validate_sources(project: &Path) -> Result<()> {
+    let kitten_source = project.join("src/kitten.rs");
     ensure(
-        project.join("src/kitten.rs").is_file(),
+        kitten_source.is_file(),
         "canonical art source src/kitten.rs is missing",
     )?;
     ensure(
@@ -308,32 +512,38 @@ fn validate_sources(project: &Path) -> Result<()> {
     ensure(
         reference_path.is_file(),
         format!(
-            "approved concept reference is missing: {}",
+            "design-provenance file is missing: {}",
             reference_path.display()
         ),
     )?;
-    let reference = image::open(&reference_path)?;
     ensure(
-        reference.width() == 1448 && reference.height() == 1086,
-        format!(
-            "approved concept reference is {}x{}, expected 1448x1086",
-            reference.width(),
-            reference.height()
-        ),
+        sha256_hex(&fs::read(&reference_path)?) == kitten::CONCEPT_REFERENCE_SHA256,
+        "design-provenance file hash changed",
     )?;
-    let source = fs::read_to_string(project.join("src/kitten.rs"))?;
+    let source = fs::read_to_string(&kitten_source)?;
+    for forbidden in [
+        "Lanczos",
+        "SOURCE_SCALE",
+        "SOURCE_PIXEL_SIZE",
+        "premultiply",
+        "unpremultiply",
+        "resize_rgba",
+        "FilterType",
+    ] {
+        ensure(
+            !source.contains(forbidden),
+            format!("production kitten renderer still contains forbidden path {forbidden:?}"),
+        )?;
+    }
     ensure(
-        source.contains("SOURCE_SCALE: u32 = 4")
-            && source.contains("Lanczos3")
-            && source.contains("pub const CANONICAL_MAP")
-            && source.contains(kitten::CONCEPT_REFERENCE_SHA256)
-            && !source.contains("smooth_shape")
-            && !source.contains("CubicCurve"),
-        "canonical source does not declare the concept-faithful pixel pipeline",
+        source.contains("pub const CANONICAL_MAP")
+            && source.contains("runtime_x / RUNTIME_PIXEL_SIZE")
+            && source.contains("runtime_y / RUNTIME_PIXEL_SIZE"),
+        "canonical source does not declare the direct matrix-to-runtime path",
     )
 }
 
-pub fn validate_project(project: &Path, check_sources: bool) -> Result<()> {
+pub fn inspect_project(project: &Path, check_sources: bool) -> Result<ValidationReport> {
     ensure(
         project.join(MANIFEST_FILE).is_file(),
         format!("{} is missing", project.join(MANIFEST_FILE).display()),
@@ -354,20 +564,61 @@ pub fn validate_project(project: &Path, check_sources: bool) -> Result<()> {
             packed.height()
         ),
     )?;
-    let canonical = kitten::render_frame();
-    validate_frame(&canonical)?;
-    for index in 0..FRAME_COUNT {
-        let frame = sheet::extract_frame(&packed, index)?;
-        ensure(
-            frame.as_raw() == canonical.as_raw(),
-            format!("runtime frame {index} is not the canonical held pose"),
-        )?;
-    }
+
+    let report = validate_packed(&packed)?;
     if check_sources {
         validate_sources(project)?;
-        validate_reviews(project, &canonical)?;
+        validate_reviews(project, &kitten::render_frame())?;
+        evidence::validate_generation_evidence(project, &packed, &report)?;
     }
-    Ok(())
+    Ok(report)
+}
+
+pub fn validate_packed(packed: &RgbaImage) -> Result<ValidationReport> {
+    ensure(
+        packed.dimensions() == (SHEET_WIDTH, SHEET_HEIGHT),
+        format!(
+            "sheet is {}x{}, expected {SHEET_WIDTH}x{SHEET_HEIGHT}",
+            packed.width(),
+            packed.height()
+        ),
+    )?;
+    let canonical = kitten::render_frame();
+    let mut report = validate_frame(&canonical)?;
+    report.sheet_rgba_sha256 = sha256_hex(packed.as_raw());
+    ensure(
+        report.sheet_rgba_sha256 == SHEET_RGBA_SHA256,
+        format!(
+            "decoded sheet RGBA SHA-256 is {}, expected {SHEET_RGBA_SHA256}",
+            report.sheet_rgba_sha256
+        ),
+    )?;
+    let mut details = Vec::new();
+    for index in 0..FRAME_COUNT {
+        report.frames_checked += 1;
+        let frame = sheet::extract_frame(packed, index)?;
+        for (x, y, actual) in frame.enumerate_pixels() {
+            let expected = canonical.get_pixel(x, y);
+            if actual != expected {
+                report.frame_to_frame_mismatches += 1;
+                details.push(format!(
+                    "frame {index} runtime ({x},{y}) expected {} actual {}",
+                    rgba_hex(expected.0),
+                    rgba_hex(actual.0)
+                ));
+            }
+        }
+    }
+    fail_with_details(
+        "packed frame identity",
+        report.frame_to_frame_mismatches,
+        &details,
+    )?;
+    Ok(report)
+}
+
+pub fn validate_project(project: &Path, check_sources: bool) -> Result<()> {
+    inspect_project(project, check_sources).map(|_| ())
 }
 
 #[cfg(test)]
@@ -375,8 +626,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_frame_meets_production_geometry() {
-        validate_frame(&kitten::render_frame()).expect("canonical frame is production-valid");
+    fn canonical_frame_meets_exact_takeover_contract() {
+        let report = validate_frame(&kitten::render_frame()).expect("canonical frame is exact");
+        assert_eq!(report.source_mismatches, 0);
+        assert_eq!(report.runtime_mismatches, 0);
+        assert_eq!(report.reconstructed_source_mismatches, 0);
+        assert_eq!(report.nonuniform_logical_blocks, 0);
+        assert_eq!(report.illegal_source_symbols, 0);
+        assert_eq!(report.illegal_runtime_colors, 0);
+        assert_eq!(report.alpha_violations, 0);
+        assert_eq!(report.logical_blocks_checked, 624);
     }
 
     #[test]
@@ -385,9 +644,10 @@ mod tests {
     }
 
     #[test]
-    fn full_sheet_is_one_honest_held_pose() {
+    fn full_sheet_is_one_exact_held_pose() {
         let frame = kitten::render_frame();
         let packed = sheet::pack_fixed_frames(&vec![frame.clone(); FRAME_COUNT]).expect("pack");
+        assert_eq!(sha256_hex(packed.as_raw()), SHEET_RGBA_SHA256);
         for index in 0..FRAME_COUNT {
             assert_eq!(
                 sheet::extract_frame(&packed, index)

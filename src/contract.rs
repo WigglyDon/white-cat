@@ -11,9 +11,8 @@ pub const FRAME_COUNT: usize = (GRID_COLUMNS * GRID_ROWS) as usize;
 pub const SHEET_WIDTH: u32 = FRAME_WIDTH * GRID_COLUMNS;
 pub const SHEET_HEIGHT: u32 = FRAME_HEIGHT * GRID_ROWS;
 
-pub const GROUND_Y: u32 = 192;
+pub const GROUND_Y: u32 = 200;
 pub const LAST_PLANTED_Y: u32 = GROUND_Y - 1;
-pub const FRAME_MARGIN: u32 = 4;
 
 pub const TERMINAL_CELL_WIDTH: u32 = 8;
 pub const TERMINAL_CELL_HEIGHT: u32 = 16;

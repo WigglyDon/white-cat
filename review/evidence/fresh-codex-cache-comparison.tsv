@@ -1,0 +1,8 @@
+check	value
+source_path	/home/don/.codex/cache/tui-pets/frame-cache/custom-white-cat/sha256-edb5769e828eb541bc967e5492e11d4bc196b724571fa58850598960d3f33b76-192x208-8x9/frames/frame_000.png
+source_file_sha256	c67e9c12b646e70bb10e4e32e22a8bec83094eb29319fdcc62221460fcfc4450
+observed_width	192
+observed_height	208
+observed_rgba_sha256	cfb50024b6b044d37a9d55f0cf995f5688a4722907cc35b7cc30a350cab7992d
+expected_rgba_sha256	cfb50024b6b044d37a9d55f0cf995f5688a4722907cc35b7cc30a350cab7992d
+runtime_pixel_mismatches	0

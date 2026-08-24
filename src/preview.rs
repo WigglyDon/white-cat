@@ -103,9 +103,9 @@ fn load_frame(project: &Path) -> Result<image::RgbaImage> {
 
 fn draw(project: &Path, mode: ReviewMode) -> Result<()> {
     let (columns, rows) = terminal::size()?;
-    if columns < 36 || rows < 8 {
+    if columns < 36 || rows < 15 {
         execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
-        print!("White Cat review needs 36x8; terminal is {columns}x{rows}. Q: quit");
+        print!("White Cat review needs 36x15; terminal is {columns}x{rows}. Q: quit");
         io::stdout().flush()?;
         return Ok(());
     }
@@ -126,7 +126,7 @@ fn draw(project: &Path, mode: ReviewMode) -> Result<()> {
         Clear(ClearType::CurrentLine)
     )?;
     print!(
-        "White Cat | approved pixel profile | {} | D/L/N/S R Q",
+        "White Cat | canonical base pose | {} | D/L/N/S R Q",
         mode.label()
     );
     io::stdout().flush()?;

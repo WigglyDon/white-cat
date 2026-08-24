@@ -1,0 +1,5 @@
+panel	x0	y0	width	height	content
+0	0	0	192	208	canonical 24x26 enlarged by independent direct 8x nearest neighbor
+1	192	0	192	208	exact production runtime frame
+2	384	0	192	208	fresh Codex cache frame
+3	576	0	192	208	RGBA XOR difference between runtime and fresh cache frame

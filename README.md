@@ -1,8 +1,10 @@
 # White Cat
 
-White Cat is a deterministic production asset pipeline for the approved quiet, watchful pixel cat used by the Codex CLI pet runtime.
+White Cat is a deterministic production asset pipeline for the frozen canonical kitten used by the Codex CLI pet runtime.
 
-The visual authority is [`concept_design_of_pixel_art_cat.png`](concept_design_of_pixel_art_cat.png). Its exact `24 x 26` geometry and five-color palette are transcribed as the canonical Rust map in [`src/kitten.rs`](src/kitten.rs). The map is rendered on a transparent `768 x 832` source canvas, downsampled once with premultiplied-alpha Lanczos filtering to one `192 x 208` runtime frame, and repeated as an honest static held pose in every cell of the required `1536 x 1872` lossless WebP sheet.
+The sole artwork authority is the exact `24 x 26` `CANONICAL_MAP` in [`src/kitten.rs`](src/kitten.rs). Each source pixel expands directly into one uniform `8 x 8` rectangle in the `192 x 208` runtime frame. There is no high-resolution intermediate, filtering, antialiasing, palette substitution, crop, or recentering. The exact frame is repeated as a static held pose in every cell of the required `1536 x 1872` lossless WebP sheet.
+
+[`concept_design_of_pixel_art_cat.png`](concept_design_of_pixel_art_cat.png) is retained only as design provenance. It is not read by the renderer and does not override the frozen matrix.
 
 ## Commands
 
@@ -21,7 +23,7 @@ Review controls:
 ```text
 D  Dark prompt placement
 L  Light prompt placement
-N  Smooth enlarged inspection
+N  Exact runtime-pixel inspection
 S  One-color silhouette
 R  Reload generated runtime source
 Q  Quit
@@ -46,6 +48,13 @@ review/approved-pixel-cat-light.png
 review/approved-pixel-cat-70x15.png
 review/approved-pixel-cat-source.png
 review/approved-pixel-cat-silhouette.png
+review/evidence/canonical-24x26.png
+review/evidence/runtime-192x208.png
+review/evidence/decoded-frame-0.png
+review/evidence/decoded-sheet-1536x1872.png
+review/evidence/block-uniformity.tsv
+review/evidence/mismatch-coordinates.tsv
+review/evidence/source-runtime-sheet-hashes.tsv
 ```
 
-Every review is generated directly from the same canonical Rust source used by the runtime. The concept board is retained as design evidence but is never consumed as a runtime sprite.
+Every review and evidence surface is generated directly from the same canonical Rust source used by the runtime. Validation checks exact source, runtime, sheet, fixed-block, frame, deterministic-generation, installation, and observed-cache identity.

@@ -5,10 +5,11 @@ use image::codecs::png::PngEncoder;
 use image::{ImageEncoder, Rgba, RgbaImage};
 
 use crate::contract::{
-    EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, MANIFEST_FILE,
-    SHEET_FILE, TERMINAL_CELL_HEIGHT, TERMINAL_CELL_WIDTH,
+    EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, MANIFEST_FILE, SHEET_FILE,
+    TERMINAL_CELL_HEIGHT, TERMINAL_CELL_WIDTH,
 };
 use crate::error::Result;
+use crate::evidence;
 use crate::kitten;
 use crate::manifest;
 use crate::sheet;
@@ -46,6 +47,20 @@ pub struct GeneratedAssets {
     pub manifest: PathBuf,
     pub sheet: PathBuf,
     pub reviews: [PathBuf; 5],
+    pub evidence: Vec<PathBuf>,
+}
+
+pub fn review_relative_paths() -> Vec<PathBuf> {
+    [
+        DARK_REVIEW_FILE,
+        LIGHT_REVIEW_FILE,
+        EXACT_REVIEW_FILE,
+        SOURCE_REVIEW_FILE,
+        SILHOUETTE_REVIEW_FILE,
+    ]
+    .into_iter()
+    .map(|name| PathBuf::from(REVIEW_DIRECTORY).join(name))
+    .collect()
 }
 
 fn fill_rect(image: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32, color: Rgba<u8>) {
@@ -112,21 +127,11 @@ fn prompt_canvas(frame: &RgbaImage, width: u32, height: u32, dark: bool) -> Rgba
     };
 
     let mut canvas = RgbaImage::from_pixel(width, height, background);
-    let available_cat_height = height.saturating_sub(8);
-    let available_cat_width = width.saturating_mul(37) / 100;
-    let scale = (available_cat_height as f32 / FRAME_HEIGHT as f32)
-        .min(available_cat_width as f32 / FRAME_WIDTH as f32)
-        .min(1.0);
-    let cat_width = (FRAME_WIDTH as f32 * scale).round().max(1.0) as u32;
-    let cat_height = (FRAME_HEIGHT as f32 * scale).round().max(1.0) as u32;
-    let rendered = if (cat_width, cat_height) == frame.dimensions() {
-        frame.clone()
-    } else {
-        kitten::resize_rgba(frame, cat_width, cat_height)
-    };
+    let cat_width = frame.width();
+    let cat_height = frame.height();
     let cat_x = 6;
     let cat_y = height.saturating_sub(cat_height + 4);
-    overlay_opaque(&mut canvas, &rendered, cat_x, cat_y);
+    overlay_opaque(&mut canvas, frame, cat_x, cat_y);
 
     let prompt_x = cat_x + cat_width + 16;
     let prompt_width = width.saturating_sub(prompt_x + 18);
@@ -183,22 +188,16 @@ pub fn exact_70x15_review(frame: &RgbaImage) -> RgbaImage {
 
 fn inspection_canvas(frame: &RgbaImage, width: u32, height: u32, silhouette: bool) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(width, height, Rgba([16, 21, 27, 255]));
-    let source = if silhouette {
+    let rendered = if silhouette {
         crate::kitten::render_silhouette_frame()
     } else {
         frame.clone()
     };
-    let scale = (width.saturating_sub(24) as f32 / source.width() as f32)
-        .min(height.saturating_sub(16) as f32 / source.height() as f32)
-        .max(0.1);
-    let target_width = (source.width() as f32 * scale).round().max(1.0) as u32;
-    let target_height = (source.height() as f32 * scale).round().max(1.0) as u32;
-    let enlarged = kitten::resize_rgba(&source, target_width, target_height);
     overlay_opaque(
         &mut canvas,
-        &enlarged,
-        width.saturating_sub(target_width) / 2,
-        height.saturating_sub(target_height) / 2,
+        &rendered,
+        width.saturating_sub(rendered.width()) / 2,
+        height.saturating_sub(rendered.height()) / 2,
     );
     canvas
 }
@@ -248,13 +247,18 @@ pub fn generate_project(project: &Path) -> Result<GeneratedAssets> {
     write_png(&reviews[0], &dark_review(&frame))?;
     write_png(&reviews[1], &light_review(&frame))?;
     write_png(&reviews[2], &exact_70x15_review(&frame))?;
-    write_png(&reviews[3], &kitten::render_source())?;
-    write_png(&reviews[4], &kitten::render_silhouette_source())?;
+    write_png(&reviews[3], &kitten::render_logical())?;
+    write_png(&reviews[4], &kitten::render_silhouette_logical())?;
+
+    let decoded = sheet::load_rgba(&project.join(SHEET_FILE))?;
+    let report = crate::validate::validate_packed(&decoded)?;
+    let evidence = evidence::write_generation_evidence(project, &decoded, &report)?;
 
     Ok(GeneratedAssets {
         manifest: project.join(MANIFEST_FILE),
         sheet: project.join(SHEET_FILE),
         reviews,
+        evidence,
     })
 }
 

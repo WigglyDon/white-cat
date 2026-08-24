@@ -23,6 +23,10 @@ fn codex_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex"))
 }
 
+pub fn installed_pet_path() -> Result<PathBuf> {
+    Ok(codex_home()?.join("pets").join(PET_ID))
+}
+
 fn unused_backup_path(directory: &Path, stem: &str) -> PathBuf {
     let first = directory.join(stem);
     if !first.exists() {
@@ -44,9 +48,17 @@ fn copy_runtime_assets(project: &Path, staging: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn install_pet(project: &Path, force: bool) -> Result<InstallOutcome> {
-    validate_project(project, true)?;
-    let root = codex_home()?;
+fn install_pet_at<F>(
+    project: &Path,
+    root: &Path,
+    force: bool,
+    check_sources: bool,
+    before_activation: F,
+) -> Result<InstallOutcome>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    validate_project(project, check_sources)?;
     let pets = root.join("pets");
     let target = pets.join(PET_ID);
     if target.exists() && !force {
@@ -78,6 +90,14 @@ pub fn install_pet(project: &Path, force: bool) -> Result<InstallOutcome> {
         backup = Some(destination);
     }
 
+    if let Err(error) = before_activation(&staging) {
+        let _ = fs::remove_dir_all(&staging);
+        if let Some(previous) = backup.as_ref() {
+            let _ = fs::rename(previous, &target);
+        }
+        return Err(error);
+    }
+
     if let Err(error) = fs::rename(&staging, &target) {
         if let Some(previous) = backup.as_ref() {
             let _ = fs::rename(previous, &target);
@@ -98,14 +118,30 @@ pub fn install_pet(project: &Path, force: bool) -> Result<InstallOutcome> {
     Ok(InstallOutcome { target, backup })
 }
 
+pub fn install_pet_to_root(project: &Path, root: &Path, force: bool) -> Result<InstallOutcome> {
+    install_pet_at(project, root, force, true, |_| Ok(()))
+}
+
+pub fn install_pet(project: &Path, force: bool) -> Result<InstallOutcome> {
+    let root = codex_home()?;
+    install_pet_to_root(project, &root, force)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temporary_directory(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("white-cat-{label}-{}-{nonce}", std::process::id()))
+    }
+
     #[test]
     fn backup_names_never_overwrite() {
-        let directory =
-            std::env::temp_dir().join(format!("white-cat-backup-name-test-{}", std::process::id()));
+        let directory = temporary_directory("backup-name-test");
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).expect("create test directory");
         fs::create_dir(directory.join("white-cat.backup-fixed")).expect("create collision");
@@ -114,5 +150,32 @@ mod tests {
             directory.join("white-cat.backup-fixed-1")
         );
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn activation_failure_rolls_back_the_previous_runtime() {
+        let directory = temporary_directory("rollback-test");
+        let project = directory.join("project");
+        let root = directory.join("codex-home");
+        fs::create_dir_all(&project).expect("create generated project");
+        crate::artwork::generate_project(&project).expect("generate exact runtime payload");
+
+        let first = install_pet_at(&project, &root, false, false, |_| Ok(()))
+            .expect("install initial runtime");
+        let marker = first.target.join("rollback-marker");
+        fs::write(&marker, b"previous runtime").expect("write rollback marker");
+
+        let failure = install_pet_at(&project, &root, true, false, |staging| {
+            fs::remove_dir_all(staging)?;
+            Ok(())
+        });
+        assert!(failure.is_err(), "activation unexpectedly succeeded");
+        assert_eq!(
+            fs::read(marker).expect("previous runtime restored"),
+            b"previous runtime"
+        );
+        crate::validate::validate_project(&first.target, false)
+            .expect("restored runtime remains valid");
+        fs::remove_dir_all(directory).expect("remove rollback test directory");
     }
 }

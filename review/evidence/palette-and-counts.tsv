@@ -1,0 +1,7 @@
+symbol	meaning	rgba	logical_pixels	runtime_pixels
+.	transparent	#00000000	303	19392
+O	outline	#2A3340FF	70	4480
+B	body	#F4F2E8FF	224	14336
+S	shade	#CDD2D8FF	23	1472
+E	eye	#86D7A8FF	4	256
+TOTAL	all	NOT_APPLICABLE	624	39936

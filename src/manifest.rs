@@ -79,7 +79,7 @@ pub fn build_manifest() -> PetManifest {
     PetManifest {
         id: PET_ID.to_owned(),
         display_name: "White Cat".to_owned(),
-        description: "The approved quiet, watchful White Cat pixel profile.".to_owned(),
+        description: "The frozen canonical White Cat base pose.".to_owned(),
         spritesheet_path: SHEET_FILE.to_owned(),
         frame: FrameGeometry {
             width: FRAME_WIDTH,

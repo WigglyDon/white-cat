@@ -1,7 +1,7 @@
 {
   "id": "white-cat",
   "displayName": "White Cat",
-  "description": "The approved quiet, watchful White Cat pixel profile.",
+  "description": "The frozen canonical White Cat base pose.",
   "spritesheetPath": "spritesheet.webp",
   "frame": {
     "width": 192,

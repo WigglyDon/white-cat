@@ -1,35 +1,27 @@
-# Canonical White Cat Pixel Direction
+# Canonical White Cat Artwork Contract
 
-`concept_design_of_pixel_art_cat.png` is the approved visual authority. Its
-SHA-256 is
-`974bae7813b6b80a0626ca5b3d292244f5abf937f97a3f6c3102fb70180ea322`.
-The production character is not a reinterpretation of that board: it is the
-same quiet, watchful profile geometry and coloring.
-
-The canonical executable artwork is the literal `24 x 26` `CANONICAL_MAP` in
-`src/kitten.rs`. Its defining features are the stepped paired ears, one green
-profile eye, long upright chest, low left-wrapped tail, pale-gray underside
-accents, separated forepaws, and planted row-23 baseline. Smooth anatomy,
-front-facing mascot construction, pink facial features, curves, and selectable
-variants are outside this direction.
+The exact `24 x 26` `CANONICAL_MAP` in `src/kitten.rs` is the sole production
+artwork authority. Its normalized matrix-text SHA-256 is
+`9fff8b4d54bdae285fa048ce872857e93a55ba1e034622cab5435b672e9d6735`.
+Coordinates, symbols, geometry, palette, and transparent padding are frozen.
 
 The five source symbols and colors are:
 
 ```text
 .  transparent  #00000000
 O  outline      #2A3340FF
-W  white fur    #F4F2E8FF
-S  cool shadow  #CDD2D8FF
-E  green eye    #86D7A8FF
+B  body         #F4F2E8FF
+S  shade        #CDD2D8FF
+E  eye          #86D7A8FF
 ```
 
-Each logical pixel occupies an `8 x 8` runtime block. To retain the repository's
-production filtering contract, Rust authors those blocks into the fixed
-`768 x 832` (`4x`) premultiplied source canvas, then performs one Lanczos
-downsample to the `192 x 208` frame. All 72 allocated cells contain that same
-honest held pose; animation remains deferred.
+Every logical pixel becomes one uniform `8 x 8` rectangle in the final
+`192 x 208` RGBA frame. Production rendering performs no intermediate
+expansion, filtering, antialiasing, premultiplication transform, alpha repair,
+crop, trim, fit, or occupied-bounds centering. The last planted runtime pixel
+is at `y = 199`; `GROUND_Y = 200`.
 
-Review uses the exact production render on dark and light prompt surfaces, the
-literal `70 x 15` terminal surface, the `4x` authored source, and a one-color
-silhouette. The concept PNG is reference evidence only and is never packed into
-the runtime sheet.
+All 72 fixed sheet cells contain the same exact frame while animation remains
+deferred. Review surfaces consume this frame directly. Generated PNG and WebP
+files are outputs only. `concept_design_of_pixel_art_cat.png` is retained as
+design provenance and is never executable source art.
