@@ -6,4 +6,4 @@ white-cat.backup-*/
 *.tmp
 *.scratch
 
-# Static runtime assets and the approved visual authority remain trackable.
+# Approved runtime assets remain trackable when a future design is selected.

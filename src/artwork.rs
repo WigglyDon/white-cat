@@ -1,375 +1,261 @@
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use image::{Rgba, RgbaImage};
+use image::codecs::png::PngEncoder;
+use image::{ImageEncoder, Rgba, RgbaImage};
 
 use crate::contract::{
-    ANIMATION_RANGES, COLUMNS, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, PIXEL_SCALE, SOURCE_HEIGHT,
-    SOURCE_WIDTH, resolve_state,
+    EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, MANIFEST_FILE,
+    SHEET_FILE, TERMINAL_CELL_HEIGHT, TERMINAL_CELL_WIDTH,
 };
-use crate::maps::{AUDITION_CANDIDATES, POSES, PixelMap};
-use crate::{Result, WhiteCatError};
+use crate::error::Result;
+use crate::kitten;
+use crate::manifest;
+use crate::sheet;
 
-pub const PALETTE: [(char, [u8; 4]); 5] = [
-    ('.', [0, 0, 0, 0]),
-    ('O', [42, 51, 64, 255]),
-    ('W', [244, 242, 232, 255]),
-    ('S', [205, 210, 216, 255]),
-    ('E', [134, 215, 168, 255]),
-];
+pub const REVIEW_DIRECTORY: &str = "review";
+pub const DARK_REVIEW_FILE: &str = "approved-pixel-cat-dark.png";
+pub const LIGHT_REVIEW_FILE: &str = "approved-pixel-cat-light.png";
+pub const EXACT_REVIEW_FILE: &str = "approved-pixel-cat-70x15.png";
+pub const SOURCE_REVIEW_FILE: &str = "approved-pixel-cat-source.png";
+pub const SILHOUETTE_REVIEW_FILE: &str = "approved-pixel-cat-silhouette.png";
+pub const LARGE_REVIEW_WIDTH: u32 = 960;
+pub const LARGE_REVIEW_HEIGHT: u32 = 320;
 
-pub const FRAME_POSES: &[(&str, [&str; COLUMNS])] = &[
-    (
-        "idle",
-        [
-            "neutral", "neutral", "blink", "neutral", "ear", "neutral", "tail", "neutral",
-        ],
-    ),
-    (
-        "running-right",
-        [
-            "run-right-a",
-            "run-right-b",
-            "run-right-a",
-            "run-right-b",
-            "run-right-a",
-            "run-right-b",
-            "run-right-a",
-            "run-right-b",
-        ],
-    ),
-    (
-        "running-left",
-        [
-            "run-left-a",
-            "run-left-b",
-            "run-left-a",
-            "run-left-b",
-            "run-left-a",
-            "run-left-b",
-            "run-left-a",
-            "run-left-b",
-        ],
-    ),
-    (
-        "waving",
-        [
-            "neutral",
-            "wave-low",
-            "wave-high",
-            "wave-high",
-            "wave-low",
-            "wave-high",
-            "wave-low",
-            "neutral",
-        ],
-    ),
-    (
-        "jumping",
-        [
-            "run-right-a",
-            "run-right-b",
-            "jump-right-a",
-            "jump-right-b",
-            "jump-right-b",
-            "jump-right-a",
-            "run-right-b",
-            "run-right-a",
-        ],
-    ),
-    (
-        "failed",
-        [
-            "failed",
-            "failed",
-            "failed-blink",
-            "failed",
-            "failed",
-            "failed-blink",
-            "failed",
-            "failed",
-        ],
-    ),
-    (
-        "waiting",
-        [
-            "neutral", "waiting", "waiting", "neutral", "waiting", "waiting", "neutral", "neutral",
-        ],
-    ),
-    (
-        "running",
-        [
-            "working",
-            "working",
-            "working-press",
-            "working-press",
-            "working",
-            "working",
-            "working-press",
-            "working",
-        ],
-    ),
-    (
-        "review",
-        [
-            "neutral", "review", "review", "blink", "review", "review", "neutral", "neutral",
-        ],
-    ),
-];
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ParsedArtwork {
-    poses: BTreeMap<String, Vec<String>>,
+#[derive(Clone, Copy, Debug)]
+pub enum ReviewMode {
+    Dark,
+    Light,
+    Native,
+    Silhouette,
 }
 
-impl ParsedArtwork {
-    pub fn pose(&self, name: &str) -> Result<&[String]> {
-        self.poses
-            .get(name)
-            .map(Vec::as_slice)
-            .ok_or_else(|| WhiteCatError::new(format!("unknown pose {name:?}")))
-    }
-
-    pub fn len(&self) -> usize {
-        self.poses.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.poses.is_empty()
-    }
-}
-
-pub fn palette_color(pixel: char) -> Option<Rgba<u8>> {
-    PALETTE
-        .iter()
-        .find_map(|(symbol, color)| (*symbol == pixel).then_some(Rgba(*color)))
-}
-
-pub fn pose(name: &str) -> Option<&'static PixelMap> {
-    POSES
-        .iter()
-        .find_map(|(pose_name, map)| (*pose_name == name).then_some(map))
-}
-
-pub fn frame_pose_names(state: &str) -> Result<&'static [&'static str; COLUMNS]> {
-    let resolved = resolve_state(state)
-        .ok_or_else(|| WhiteCatError::new(format!("unknown state {state:?}")))?;
-    FRAME_POSES
-        .iter()
-        .find_map(|(name, poses)| (*name == resolved).then_some(poses))
-        .ok_or_else(|| WhiteCatError::new(format!("state {resolved:?} has no frame plan")))
-}
-
-fn validate_rows<S: AsRef<str>>(name: &str, rows: &[S]) -> Result<()> {
-    if rows.len() != SOURCE_HEIGHT {
-        return Err(WhiteCatError::new(format!(
-            "pose {name} has {} rows, expected {SOURCE_HEIGHT}",
-            rows.len()
-        )));
-    }
-    for (row_index, row) in rows.iter().enumerate() {
-        let row = row.as_ref();
-        if row.len() != SOURCE_WIDTH {
-            return Err(WhiteCatError::new(format!(
-                "pose {name} row {row_index} has width {}, expected {SOURCE_WIDTH}",
-                row.len()
-            )));
-        }
-        if row.as_bytes().first() != Some(&b'.') || row.as_bytes().last() != Some(&b'.') {
-            return Err(WhiteCatError::new(format!(
-                "pose {name} row {row_index} violates horizontal padding"
-            )));
-        }
-        if let Some(pixel) = row.chars().find(|pixel| palette_color(*pixel).is_none()) {
-            return Err(WhiteCatError::new(format!(
-                "pose {name} row {row_index} uses unknown pixel {pixel:?}"
-            )));
+impl ReviewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "dark prompt",
+            Self::Light => "light prompt",
+            Self::Native => "pixel inspection",
+            Self::Silhouette => "one-color silhouette",
         }
     }
-    Ok(())
 }
 
-pub fn validate_source_maps() -> Result<()> {
-    if SOURCE_WIDTH * PIXEL_SCALE != FRAME_WIDTH || SOURCE_HEIGHT * PIXEL_SCALE != FRAME_HEIGHT {
-        return Err(WhiteCatError::new(
-            "source geometry does not scale exactly to the runtime frame",
-        ));
+#[derive(Debug)]
+pub struct GeneratedAssets {
+    pub manifest: PathBuf,
+    pub sheet: PathBuf,
+    pub reviews: [PathBuf; 5],
+}
+
+fn fill_rect(image: &mut RgbaImage, x: u32, y: u32, width: u32, height: u32, color: Rgba<u8>) {
+    let x1 = x.saturating_add(width).min(image.width());
+    let y1 = y.saturating_add(height).min(image.height());
+    for py in y..y1 {
+        for px in x..x1 {
+            image.put_pixel(px, py, color);
+        }
     }
-    for (name, rows) in POSES {
-        validate_rows(name, rows)?;
-    }
-    if FRAME_POSES.len() != ANIMATION_RANGES.len() {
-        return Err(WhiteCatError::new(
-            "frame pose rows do not match the runtime allocation",
-        ));
-    }
-    for range in ANIMATION_RANGES {
-        let names = frame_pose_names(range.name)?;
-        for name in names {
-            if pose(name).is_none() {
-                return Err(WhiteCatError::new(format!(
-                    "animation {} references unknown pose {name}",
-                    range.name
-                )));
+}
+
+fn overlay_opaque(destination: &mut RgbaImage, source: &RgbaImage, x: u32, y: u32) {
+    for sy in 0..source.height() {
+        for sx in 0..source.width() {
+            let dx = x + sx;
+            let dy = y + sy;
+            if dx >= destination.width() || dy >= destination.height() {
+                continue;
             }
-        }
-    }
-    if AUDITION_CANDIDATES.len() != 5 {
-        return Err(WhiteCatError::new(
-            "live audition must contain exactly five cat candidates",
-        ));
-    }
-    for candidate in AUDITION_CANDIDATES {
-        for name in candidate.poses {
-            if pose(name).is_none() {
-                return Err(WhiteCatError::new(format!(
-                    "audition candidate {} references unknown pose {name}",
-                    candidate.id
-                )));
+            let source_pixel = source.get_pixel(sx, sy);
+            let alpha = u32::from(source_pixel[3]);
+            if alpha == 0 {
+                continue;
             }
+            let target = destination.get_pixel_mut(dx, dy);
+            let inverse = 255 - alpha;
+            for channel in 0..3 {
+                target[channel] = ((u32::from(source_pixel[channel]) * alpha
+                    + u32::from(target[channel]) * inverse
+                    + 127)
+                    / 255) as u8;
+            }
+            target[3] = 255;
         }
     }
-    Ok(())
 }
 
-pub fn render_pose<S: AsRef<str>>(name: &str, rows: &[S]) -> Result<RgbaImage> {
-    validate_rows(name, rows)?;
-    let mut frame = RgbaImage::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32);
-    for (source_y, row) in rows.iter().enumerate() {
-        for (source_x, pixel) in row.as_ref().chars().enumerate() {
-            let color = palette_color(pixel).expect("validated palette pixel");
-            let origin_x = source_x * PIXEL_SCALE;
-            let origin_y = source_y * PIXEL_SCALE;
-            for y in origin_y..origin_y + PIXEL_SCALE {
-                for x in origin_x..origin_x + PIXEL_SCALE {
-                    frame.put_pixel(x as u32, y as u32, color);
-                }
-            }
-        }
+fn prompt_canvas(frame: &RgbaImage, width: u32, height: u32, dark: bool) -> RgbaImage {
+    let background = if dark {
+        Rgba([13, 17, 22, 255])
+    } else {
+        Rgba([244, 241, 234, 255])
+    };
+    let panel = if dark {
+        Rgba([24, 30, 37, 255])
+    } else {
+        Rgba([255, 253, 248, 255])
+    };
+    let border = if dark {
+        Rgba([71, 83, 95, 255])
+    } else {
+        Rgba([173, 180, 184, 255])
+    };
+    let text = if dark {
+        Rgba([135, 149, 161, 255])
+    } else {
+        Rgba([91, 100, 108, 255])
+    };
+    let accent = if dark {
+        Rgba([104, 196, 151, 255])
+    } else {
+        Rgba([38, 126, 92, 255])
+    };
+
+    let mut canvas = RgbaImage::from_pixel(width, height, background);
+    let available_cat_height = height.saturating_sub(8);
+    let available_cat_width = width.saturating_mul(37) / 100;
+    let scale = (available_cat_height as f32 / FRAME_HEIGHT as f32)
+        .min(available_cat_width as f32 / FRAME_WIDTH as f32)
+        .min(1.0);
+    let cat_width = (FRAME_WIDTH as f32 * scale).round().max(1.0) as u32;
+    let cat_height = (FRAME_HEIGHT as f32 * scale).round().max(1.0) as u32;
+    let rendered = if (cat_width, cat_height) == frame.dimensions() {
+        frame.clone()
+    } else {
+        kitten::resize_rgba(frame, cat_width, cat_height)
+    };
+    let cat_x = 6;
+    let cat_y = height.saturating_sub(cat_height + 4);
+    overlay_opaque(&mut canvas, &rendered, cat_x, cat_y);
+
+    let prompt_x = cat_x + cat_width + 16;
+    let prompt_width = width.saturating_sub(prompt_x + 18);
+    let prompt_height = (height / 4).clamp(42, 76).min(height.saturating_sub(8));
+    let prompt_y = height.saturating_sub(prompt_height + height / 7);
+    if prompt_width > 20 {
+        fill_rect(
+            &mut canvas,
+            prompt_x,
+            prompt_y,
+            prompt_width,
+            prompt_height,
+            border,
+        );
+        fill_rect(
+            &mut canvas,
+            prompt_x + 2,
+            prompt_y + 2,
+            prompt_width.saturating_sub(4),
+            prompt_height.saturating_sub(4),
+            panel,
+        );
+        fill_rect(
+            &mut canvas,
+            prompt_x + 17,
+            prompt_y + prompt_height / 2 - 2,
+            (prompt_width * 48 / 100).max(8),
+            4,
+            text,
+        );
+        fill_rect(
+            &mut canvas,
+            prompt_x + 10,
+            prompt_y + prompt_height / 2 - 7,
+            3,
+            15,
+            accent,
+        );
     }
-    Ok(frame)
+    canvas
 }
 
-pub fn build_frames() -> Result<Vec<RgbaImage>> {
-    validate_source_maps()?;
-    let mut frames = Vec::with_capacity(FRAME_COUNT);
-    for range in ANIMATION_RANGES {
-        for pose_name in frame_pose_names(range.name)? {
-            let map = pose(pose_name).expect("validated frame pose");
-            frames.push(render_pose(pose_name, map)?);
-        }
-    }
-    if frames.len() != FRAME_COUNT {
-        return Err(WhiteCatError::new(format!(
-            "built {} frames, expected {FRAME_COUNT}",
-            frames.len()
-        )));
-    }
-    Ok(frames)
+pub fn dark_review(frame: &RgbaImage) -> RgbaImage {
+    prompt_canvas(frame, LARGE_REVIEW_WIDTH, LARGE_REVIEW_HEIGHT, true)
 }
 
-pub fn parse_maps_source(source: &str) -> Result<ParsedArtwork> {
-    let mut poses = BTreeMap::new();
-    let mut current_name: Option<String> = None;
-    let mut current_rows = Vec::new();
-    let mut in_poses = false;
-    let mut awaiting_name = false;
-    let mut reading_rows = false;
-
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !in_poses {
-            in_poses = trimmed.starts_with("pub const POSES:");
-            continue;
-        }
-        if trimmed == "];" && current_name.is_none() {
-            break;
-        }
-        if current_name.is_none() && trimmed == "(" {
-            awaiting_name = true;
-            continue;
-        }
-        if awaiting_name {
-            let name = trimmed
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix("\","))
-                .ok_or_else(|| {
-                    WhiteCatError::new(format!("invalid pose name in Rust source: {trimmed}"))
-                })?;
-            current_name = Some(name.to_owned());
-            current_rows.clear();
-            awaiting_name = false;
-            continue;
-        }
-        if current_name.is_some() && !reading_rows && trimmed == "[" {
-            reading_rows = true;
-            continue;
-        }
-        if reading_rows && trimmed == "]," {
-            let name = current_name.take().expect("pose parser state");
-            validate_rows(&name, &current_rows)?;
-            if poses.insert(name.clone(), current_rows.clone()).is_some() {
-                return Err(WhiteCatError::new(format!("duplicate pose {name:?}")));
-            }
-            reading_rows = false;
-            continue;
-        }
-        if reading_rows {
-            let row = trimmed
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix("\","))
-                .ok_or_else(|| {
-                    WhiteCatError::new(format!("invalid row in pose source: {trimmed}"))
-                })?;
-            current_rows.push(row.to_owned());
-        }
-    }
-
-    if let Some(name) = current_name {
-        return Err(WhiteCatError::new(format!("unterminated pose {name:?}")));
-    }
-    if poses.is_empty() {
-        return Err(WhiteCatError::new("pixel-map source defines no poses"));
-    }
-    for (_, names) in FRAME_POSES {
-        for name in names {
-            if !poses.contains_key(*name) {
-                return Err(WhiteCatError::new(format!(
-                    "live source is missing required pose {name:?}"
-                )));
-            }
-        }
-    }
-    for candidate in AUDITION_CANDIDATES {
-        for name in candidate.poses {
-            if !poses.contains_key(name) {
-                return Err(WhiteCatError::new(format!(
-                    "live source is missing audition pose {name:?}"
-                )));
-            }
-        }
-    }
-    Ok(ParsedArtwork { poses })
+pub fn light_review(frame: &RgbaImage) -> RgbaImage {
+    prompt_canvas(frame, LARGE_REVIEW_WIDTH, LARGE_REVIEW_HEIGHT, false)
 }
 
-pub fn load_maps_source(path: &Path) -> Result<ParsedArtwork> {
-    let source = fs::read_to_string(path).map_err(|error| {
-        WhiteCatError::new(format!(
-            "cannot read pixel-map source {}: {error}",
-            path.display()
-        ))
-    })?;
-    parse_maps_source(&source)
+pub fn exact_70x15_review(frame: &RgbaImage) -> RgbaImage {
+    prompt_canvas(frame, EXACT_REVIEW_WIDTH, EXACT_REVIEW_HEIGHT, true)
 }
 
-pub fn parsed_source_pose<'a>(
-    artwork: &'a ParsedArtwork,
-    state: &str,
-    frame_index: usize,
-) -> Result<&'a [String]> {
-    let names = frame_pose_names(state)?;
-    artwork.pose(names[frame_index % names.len()])
+fn inspection_canvas(frame: &RgbaImage, width: u32, height: u32, silhouette: bool) -> RgbaImage {
+    let mut canvas = RgbaImage::from_pixel(width, height, Rgba([16, 21, 27, 255]));
+    let source = if silhouette {
+        crate::kitten::render_silhouette_frame()
+    } else {
+        frame.clone()
+    };
+    let scale = (width.saturating_sub(24) as f32 / source.width() as f32)
+        .min(height.saturating_sub(16) as f32 / source.height() as f32)
+        .max(0.1);
+    let target_width = (source.width() as f32 * scale).round().max(1.0) as u32;
+    let target_height = (source.height() as f32 * scale).round().max(1.0) as u32;
+    let enlarged = kitten::resize_rgba(&source, target_width, target_height);
+    overlay_opaque(
+        &mut canvas,
+        &enlarged,
+        width.saturating_sub(target_width) / 2,
+        height.saturating_sub(target_height) / 2,
+    );
+    canvas
+}
+
+pub fn terminal_review(frame: &RgbaImage, columns: u16, rows: u16, mode: ReviewMode) -> RgbaImage {
+    let width = u32::from(columns) * TERMINAL_CELL_WIDTH;
+    let height = u32::from(rows) * TERMINAL_CELL_HEIGHT;
+    match mode {
+        ReviewMode::Dark => prompt_canvas(frame, width, height, true),
+        ReviewMode::Light => prompt_canvas(frame, width, height, false),
+        ReviewMode::Native => inspection_canvas(frame, width, height, false),
+        ReviewMode::Silhouette => inspection_canvas(frame, width, height, true),
+    }
+}
+
+pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    PngEncoder::new(&mut bytes).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(bytes)
+}
+
+fn write_png(path: &Path, image: &RgbaImage) -> Result<()> {
+    sheet::write_atomic(path, &encode_png(image)?)
+}
+
+pub fn generate_project(project: &Path) -> Result<GeneratedAssets> {
+    let frame = kitten::render_frame();
+    let frames = vec![frame.clone(); FRAME_COUNT];
+    let packed = sheet::pack_fixed_frames(&frames)?;
+    manifest::write_manifest(project)?;
+    sheet::write_lossless_webp(&project.join(SHEET_FILE), &packed)?;
+
+    let review_directory = project.join(REVIEW_DIRECTORY);
+    fs::create_dir_all(&review_directory)?;
+    let reviews = [
+        review_directory.join(DARK_REVIEW_FILE),
+        review_directory.join(LIGHT_REVIEW_FILE),
+        review_directory.join(EXACT_REVIEW_FILE),
+        review_directory.join(SOURCE_REVIEW_FILE),
+        review_directory.join(SILHOUETTE_REVIEW_FILE),
+    ];
+    write_png(&reviews[0], &dark_review(&frame))?;
+    write_png(&reviews[1], &light_review(&frame))?;
+    write_png(&reviews[2], &exact_70x15_review(&frame))?;
+    write_png(&reviews[3], &kitten::render_source())?;
+    write_png(&reviews[4], &kitten::render_silhouette_source())?;
+
+    Ok(GeneratedAssets {
+        manifest: project.join(MANIFEST_FILE),
+        sheet: project.join(SHEET_FILE),
+        reviews,
+    })
 }
 
 #[cfg(test)]
@@ -377,109 +263,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_pose_is_a_complete_literal_map() {
-        validate_source_maps().unwrap();
-        assert_eq!((SOURCE_WIDTH, SOURCE_HEIGHT, PIXEL_SCALE), (24, 26, 8));
-    }
-
-    #[test]
-    fn palette_matches_the_approved_concept() {
+    fn exact_terminal_review_has_literal_70x15_pixel_geometry() {
         assert_eq!(
-            PALETTE,
-            [
-                ('.', [0, 0, 0, 0]),
-                ('O', [42, 51, 64, 255]),
-                ('W', [244, 242, 232, 255]),
-                ('S', [205, 210, 216, 255]),
-                ('E', [134, 215, 168, 255]),
-            ]
+            exact_70x15_review(&kitten::render_frame()).dimensions(),
+            (EXACT_REVIEW_WIDTH, EXACT_REVIEW_HEIGHT)
         );
     }
 
     #[test]
-    fn idle_plan_is_restrained() {
+    fn production_reviews_are_deterministic() {
+        let frame = kitten::render_frame();
         assert_eq!(
-            frame_pose_names("idle").unwrap(),
-            &[
-                "neutral", "neutral", "blink", "neutral", "ear", "neutral", "tail", "neutral"
-            ]
+            encode_png(&dark_review(&frame)).expect("first PNG"),
+            encode_png(&dark_review(&frame)).expect("second PNG")
         );
-    }
-
-    #[test]
-    fn idle_variants_change_at_most_six_pixels() {
-        let neutral = pose("neutral").unwrap();
-        for name in ["blink", "ear", "tail"] {
-            let variant = pose(name).unwrap();
-            let changed = neutral
-                .iter()
-                .zip(variant)
-                .flat_map(|(before, after)| before.bytes().zip(after.bytes()))
-                .filter(|(before, after)| before != after)
-                .count();
-            assert!(changed <= 6, "{name} changed {changed} pixels");
-            assert_eq!(&variant[8..18], &neutral[8..18]);
-            assert_eq!(&variant[20..24], &neutral[20..24]);
-        }
-    }
-
-    #[test]
-    fn audition_contains_five_stable_idle_cats() {
-        assert_eq!(AUDITION_CANDIDATES.len(), 5);
-        for candidate in AUDITION_CANDIDATES {
-            let neutral = pose(candidate.poses[0]).unwrap();
-            for name in candidate.poses {
-                let variant = pose(name).unwrap();
-                let changed = neutral
-                    .iter()
-                    .zip(variant)
-                    .flat_map(|(before, after)| before.bytes().zip(after.bytes()))
-                    .filter(|(before, after)| before != after)
-                    .count();
-                assert!(
-                    changed <= 6,
-                    "candidate {} pose {name} changed {changed} pixels",
-                    candidate.id
-                );
-                assert_eq!(
-                    &variant[20..24],
-                    &neutral[20..24],
-                    "candidate {} moved its planted feet in {name}",
-                    candidate.id
-                );
-                let lowest = variant
-                    .iter()
-                    .rposition(|row| row.bytes().any(|pixel| pixel != b'.'));
-                assert_eq!(lowest, Some(23), "candidate {} lost baseline", candidate.id);
-            }
-        }
-    }
-
-    #[test]
-    fn live_parser_reads_the_same_compiled_maps() {
-        let parsed = parse_maps_source(include_str!("maps.rs")).unwrap();
-        assert_eq!(parsed.len(), POSES.len());
-        for (name, map) in POSES {
-            let expected: Vec<String> = map.iter().map(|row| (*row).to_owned()).collect();
-            assert_eq!(parsed.pose(name).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn fixed_scale_produces_solid_source_blocks() {
-        let frame = render_pose("neutral", pose("neutral").unwrap()).unwrap();
-        for source_y in 0..SOURCE_HEIGHT {
-            for source_x in 0..SOURCE_WIDTH {
-                let first = frame.get_pixel(
-                    (source_x * PIXEL_SCALE) as u32,
-                    (source_y * PIXEL_SCALE) as u32,
-                );
-                for y in source_y * PIXEL_SCALE..(source_y + 1) * PIXEL_SCALE {
-                    for x in source_x * PIXEL_SCALE..(source_x + 1) * PIXEL_SCALE {
-                        assert_eq!(frame.get_pixel(x as u32, y as u32), first);
-                    }
-                }
-            }
-        }
     }
 }

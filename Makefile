@@ -1,48 +1,30 @@
-CARGO ?= cargo
-STATE ?= idle
-CANDIDATE ?= 1
-FRAME ?= 0
+.PHONY: all live review generate fmt check test validate build install install-force
 
-.PHONY: setup status preview live tui start validate generate test build install install-force clean
+all: live
 
-.DEFAULT_GOAL := live
-
-setup:
-	$(CARGO) fetch
-
-status:
-	@$(CARGO) run --quiet -- status
-
-preview:
-	@$(CARGO) run --quiet -- preview --state "$(STATE)" --frame "$(FRAME)"
-
-live:
-	@$(CARGO) run --quiet -- live --candidate "$(CANDIDATE)"
-
-tui: live
-
-start: live
+live review:
+	cargo run --quiet -- preview
 
 generate:
-	@$(CARGO) run --quiet -- generate
+	cargo run --quiet -- generate
 
-validate:
-	@$(CARGO) run --quiet -- validate
+fmt:
+	cargo fmt --check
+
+check:
+	cargo check --all-targets
 
 test:
-	$(CARGO) test --all-targets
+	cargo test
 
-build: generate
-	@$(CARGO) run --quiet -- validate
-	$(CARGO) test --all-targets
+validate: generate
+	cargo run --quiet -- validate
 
-install:
-	$(MAKE) build
-	@$(CARGO) run --quiet -- install
+build: fmt check test validate
+	cargo build --release
 
-install-force:
-	$(MAKE) build
-	@$(CARGO) run --quiet -- install --force
+install: build
+	cargo run --quiet --release -- install
 
-clean:
-	$(CARGO) clean
+install-force: build
+	cargo run --quiet --release -- install --force

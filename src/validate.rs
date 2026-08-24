@@ -1,494 +1,400 @@
-use std::collections::BTreeSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 
 use image::RgbaImage;
 
-use crate::artwork::{build_frames, load_maps_source};
-use crate::contract::{
-    ALIASES, ANIMATION_RANGES, COLUMNS, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, GROUND_PIXEL_Y,
-    GROUND_Y, GROUNDED_ANIMATIONS, JUMP_GROUNDED_FRAMES, ROWS, TRANSPARENT_MARGIN, animation_fps,
-    animation_loops, animation_timeline, state_for_index,
+use crate::artwork::{
+    self, DARK_REVIEW_FILE, EXACT_REVIEW_FILE, LARGE_REVIEW_HEIGHT, LARGE_REVIEW_WIDTH,
+    LIGHT_REVIEW_FILE, REVIEW_DIRECTORY, SILHOUETTE_REVIEW_FILE, SOURCE_REVIEW_FILE,
 };
-use crate::manifest::{FrameAllocation, FrameGeometry, Manifest, load_manifest};
-use crate::sheet::{extract_fixed_frames, load_sheet, webp_chunk_ids};
-use crate::{Result, WhiteCatError};
+use crate::contract::{
+    ALIASES, EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_MARGIN,
+    FRAME_WIDTH, GRID_COLUMNS, GRID_ROWS, LAST_PLANTED_Y, MANIFEST_FILE, PET_ID, SHEET_FILE,
+    SHEET_HEIGHT, SHEET_WIDTH, STATES, state_named,
+};
+use crate::error::{Result, fail};
+use crate::kitten::{self, EYE, FUR, OUTLINE, SHADOW};
+use crate::manifest::{self, PetManifest};
+use crate::sheet;
 
-const ALPHA_THRESHOLD: u8 = 8;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrameBounds {
-    pub left: usize,
-    pub top: usize,
-    pub right: usize,
-    pub bottom_exclusive: usize,
+fn ensure(condition: bool, message: impl Into<String>) -> Result<()> {
+    if condition { Ok(()) } else { fail(message) }
 }
 
-impl FrameBounds {
-    pub fn bottom(self) -> usize {
-        self.bottom_exclusive - 1
-    }
-
-    pub fn height(self) -> usize {
-        self.bottom_exclusive - self.top
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrameRecord {
-    pub index: usize,
-    pub animation: &'static str,
-    pub bounds: FrameBounds,
-}
-
-fn require(condition: bool, message: impl Into<String>) -> Result<()> {
-    if condition {
-        Ok(())
-    } else {
-        Err(WhiteCatError::new(message))
-    }
-}
-
-pub fn opaque_bounds(frame: &RgbaImage) -> Result<FrameBounds> {
-    let mut left = FRAME_WIDTH;
-    let mut top = FRAME_HEIGHT;
-    let mut right = 0;
-    let mut bottom = 0;
+fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let mut min_x = image.width();
+    let mut min_y = image.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
     let mut found = false;
-    for y in 0..FRAME_HEIGHT {
-        for x in 0..FRAME_WIDTH {
-            if frame.get_pixel(x as u32, y as u32).0[3] >= ALPHA_THRESHOLD {
-                found = true;
-                left = left.min(x);
-                top = top.min(y);
-                right = right.max(x + 1);
-                bottom = bottom.max(y + 1);
-            }
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 8 {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            found = true;
         }
     }
-    require(found, "runtime frame is blank")?;
-    Ok(FrameBounds {
-        left,
-        top,
-        right,
-        bottom_exclusive: bottom,
-    })
+    found.then_some((min_x, min_y, max_x, max_y))
 }
 
-pub fn frame_records(frames: &[RgbaImage]) -> Result<Vec<FrameRecord>> {
-    frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| {
-            Ok(FrameRecord {
-                index,
-                animation: state_for_index(index).ok_or_else(|| {
-                    WhiteCatError::new(format!("frame {index} has no allocation"))
-                })?,
-                bounds: opaque_bounds(frame)?,
-            })
+fn color_distance(pixel: &[u8; 4], color: [u8; 4]) -> u32 {
+    (0..3)
+        .map(|channel| {
+            let difference = i32::from(pixel[channel]) - i32::from(color[channel]);
+            (difference * difference) as u32
         })
-        .collect()
+        .sum()
 }
 
-pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
-    require(manifest.id == "white-cat", "manifest id must be white-cat")?;
-    require(
-        manifest.display_name == "White Cat",
-        "displayName must be White Cat",
-    )?;
-    require(
-        manifest.spritesheet_path == "spritesheet.webp",
-        "invalid spritesheetPath",
-    )?;
-    require(
-        manifest.frame
-            == (FrameGeometry {
-                width: FRAME_WIDTH,
-                height: FRAME_HEIGHT,
-                columns: COLUMNS,
-                rows: ROWS,
-            }),
-        "manifest frame geometry is invalid",
-    )?;
-
-    require(
-        manifest.frame_allocation.len() == ANIMATION_RANGES.len(),
-        "frameAllocation must contain exactly nine rows",
-    )?;
-    let mut documented = BTreeSet::new();
-    for range in ANIMATION_RANGES {
-        require(
-            range.start / COLUMNS == range.end / COLUMNS,
-            format!("frameAllocation {} crosses a row", range.name),
-        )?;
-        require(
-            manifest.frame_allocation.get(range.name)
-                == Some(&FrameAllocation {
-                    start: range.start,
-                    end: range.end,
-                }),
-            format!(
-                "frameAllocation for {} must be {}..{}",
-                range.name, range.start, range.end
-            ),
-        )?;
-        documented.extend(range.start..=range.end);
-    }
-    require(
-        documented == (0..FRAME_COUNT).collect(),
-        "frameAllocation must cover every cell once",
-    )?;
-
-    let required: Vec<&str> = ANIMATION_RANGES
-        .iter()
-        .map(|range| range.name)
-        .chain(ALIASES.iter().map(|(alias, _)| *alias))
-        .collect();
-    for name in required {
-        let spec = manifest.animations.get(name).ok_or_else(|| {
-            WhiteCatError::new(format!("required animation or alias is missing: {name}"))
-        })?;
-        require(
-            spec.frames == animation_timeline(name).expect("known timeline"),
-            format!("animation {name} has the wrong timeline"),
-        )?;
-        require(
-            spec.fps == animation_fps(name).expect("known FPS"),
-            format!("animation {name} has the wrong FPS"),
-        )?;
-        require(
-            spec.loops == animation_loops(name),
-            format!("animation {name} has wrong loop behavior"),
-        )?;
-        require(
-            spec.fallback == "idle",
-            format!("animation {name} fallback must be idle"),
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_webp_container(path: &Path) -> Result<()> {
-    let chunks = webp_chunk_ids(path)?;
-    require(
-        chunks
-            .iter()
-            .filter(|chunk| chunk.as_slice() == b"VP8L")
-            .count()
-            == 1,
-        "spritesheet must contain one lossless VP8L image",
-    )?;
-    require(
-        !chunks.iter().any(|chunk| chunk.as_slice() == b"VP8 "),
-        "spritesheet contains a lossy VP8 image",
-    )?;
-    require(
-        !chunks
-            .iter()
-            .any(|chunk| chunk.as_slice() == b"ANIM" || chunk.as_slice() == b"ANMF"),
-        "spritesheet must be static",
-    )
-}
-
-fn validate_frames(frames: &[RgbaImage]) -> Result<()> {
-    require(
-        frames.len() == FRAME_COUNT,
-        "packed sheet has the wrong cell count",
-    )?;
-    for (index, frame) in frames.iter().enumerate() {
-        let mut transparent = false;
-        let mut content = false;
-        for pixel in frame.pixels() {
-            transparent |= pixel.0[3] == 0;
-            content |= pixel.0[3] >= ALPHA_THRESHOLD;
-        }
-        require(content, format!("frame {index} is blank"))?;
-        require(
-            transparent && content,
-            format!("frame {index} lost transparency or content"),
-        )?;
-
-        for y in 0..FRAME_HEIGHT {
-            for x in 0..FRAME_WIDTH {
-                if !(TRANSPARENT_MARGIN..FRAME_WIDTH - TRANSPARENT_MARGIN).contains(&x)
-                    || !(TRANSPARENT_MARGIN..FRAME_HEIGHT - TRANSPARENT_MARGIN).contains(&y)
-                {
-                    require(
-                        frame.get_pixel(x as u32, y as u32).0[3] == 0,
-                        format!("frame {index} violates transparent margin"),
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn baseline_bytes(frame: &RgbaImage) -> &[u8] {
-    let start = GROUND_PIXEL_Y * FRAME_WIDTH * 4;
-    &frame.as_raw()[start..start + FRAME_WIDTH * 4]
-}
-
-pub fn validate_vertical_stability(frames: &[RgbaImage]) -> Result<Vec<FrameRecord>> {
-    require(
-        (FRAME_WIDTH, FRAME_HEIGHT) == (192, 208),
-        "fixed frame dimensions changed",
-    )?;
-    require(
-        (GROUND_Y, GROUND_PIXEL_Y) == (192, 191),
-        "canonical ground geometry changed",
-    )?;
-    let records = frame_records(frames)?;
-
-    for animation in GROUNDED_ANIMATIONS {
-        let range = ANIMATION_RANGES
-            .iter()
-            .find(|range| range.name == animation)
-            .expect("grounded animation allocation");
-        for record in &records[range.start..=range.end] {
-            require(
-                record.bounds.bottom() == GROUND_PIXEL_Y,
+fn validate_concept_cell_centers(frame: &RgbaImage) -> Result<()> {
+    for logical_y in 0..kitten::LOGICAL_HEIGHT {
+        for logical_x in 0..kitten::LOGICAL_WIDTH {
+            let symbol = kitten::canonical_symbol(logical_x, logical_y)
+                .ok_or_else(|| crate::error::WhiteCatError::new("canonical map is incomplete"))?;
+            let expected = kitten::palette_color(symbol).ok_or_else(|| {
+                crate::error::WhiteCatError::new(format!(
+                    "canonical map uses unknown symbol {symbol:?}"
+                ))
+            })?;
+            let x = logical_x as u32 * kitten::RUNTIME_PIXEL_SIZE + kitten::RUNTIME_PIXEL_SIZE / 2;
+            let y = logical_y as u32 * kitten::RUNTIME_PIXEL_SIZE + kitten::RUNTIME_PIXEL_SIZE / 2;
+            let actual = frame.get_pixel(x, y).0;
+            ensure(
+                actual == expected,
                 format!(
-                    "grounded frame {} ({animation}) ends at {}, expected {GROUND_PIXEL_Y}",
-                    record.index,
-                    record.bounds.bottom()
+                    "concept cell ({logical_x},{logical_y}) {symbol:?} rendered as {actual:?}, expected {expected:?}"
                 ),
             )?;
         }
     }
-
-    for index in JUMP_GROUNDED_FRAMES {
-        require(
-            records[index].bounds.bottom() == GROUND_PIXEL_Y,
-            format!("jump frame {index} does not return to baseline"),
-        )?;
-    }
-    let jumping = ANIMATION_RANGES
-        .iter()
-        .find(|range| range.name == "jumping")
-        .expect("jump allocation");
-    for (index, record) in records
-        .iter()
-        .enumerate()
-        .take(jumping.end - 1)
-        .skip(jumping.start + 2)
-    {
-        require(
-            record.bounds.bottom() < GROUND_PIXEL_Y,
-            format!("jump frame {index} does not leave baseline"),
-        )?;
-    }
-
-    let idle = ANIMATION_RANGES[0];
-    let reference_bounds = records[idle.start].bounds;
-    let reference_baseline = baseline_bytes(&frames[idle.start]);
-    for index in idle.start + 1..=idle.end {
-        require(
-            records[index].bounds == reference_bounds,
-            format!("idle frame {index} changes scale or placement"),
-        )?;
-        require(
-            baseline_bytes(&frames[index]) == reference_baseline,
-            format!("idle frame {index} changes baseline pixels"),
-        )?;
-    }
-    Ok(records)
-}
-
-pub fn validate_fixed_placement_sources(project: &Path) -> Result<()> {
-    let sheet_source_path = project.join("src/sheet.rs");
-    let artwork_source_path = project.join("src/artwork.rs");
-    let maps_source_path = project.join("src/maps.rs");
-    for path in [&sheet_source_path, &artwork_source_path, &maps_source_path] {
-        require(
-            path.is_file(),
-            format!("missing pure-Rust infrastructure: {}", path.display()),
-        )?;
-    }
-
-    let sheet_source = fs::read_to_string(&sheet_source_path)?;
-    for forbidden in [
-        "resize(",
-        "thumbnail(",
-        "crop_imm(",
-        "scale_to_fit",
-        "content_bounds",
-        "visible_bounds",
-    ] {
-        require(
-            !sheet_source.contains(forbidden),
-            format!("fixed-cell packer contains content normalization: {forbidden}"),
-        )?;
-    }
-    require(
-        sheet_source.contains("copy_from_slice"),
-        "fixed-cell packer must copy complete rows directly into fixed cells",
-    )?;
-
-    let artwork_source = fs::read_to_string(&artwork_source_path)?;
-    for forbidden in [
-        "polygon",
-        "ellipse",
-        "supersampl",
-        "antialias",
-        "scale_to_fit",
-    ] {
-        require(
-            !artwork_source.to_ascii_lowercase().contains(forbidden),
-            format!("artwork renderer contains forbidden construction: {forbidden}"),
-        )?;
-    }
-    load_maps_source(&maps_source_path)?;
     Ok(())
 }
 
-pub fn validate_project(project: &Path, check_sources: bool) -> Result<()> {
-    let manifest_path = project.join("pet.json");
-    let sheet_path = project.join("spritesheet.webp");
-    let manifest_exists = manifest_path.is_file();
-    let sheet_exists = sheet_path.is_file();
-    if !manifest_exists && !sheet_exists {
-        return Err(WhiteCatError::new(
-            "No White Cat runtime assets have been built",
-        ));
+fn validate_connected_silhouette(frame: &RgbaImage) -> Result<()> {
+    let occupied: HashSet<(u32, u32)> = frame
+        .enumerate_pixels()
+        .filter(|(_, _, pixel)| pixel[3] >= 32)
+        .map(|(x, y, _)| (x, y))
+        .collect();
+    let start = *occupied
+        .iter()
+        .next()
+        .ok_or_else(|| crate::error::WhiteCatError::new("canonical frame is empty"))?;
+    let mut reached = HashSet::new();
+    let mut queue = VecDeque::from([start]);
+    while let Some((x, y)) = queue.pop_front() {
+        if !occupied.contains(&(x, y)) || !reached.insert((x, y)) {
+            continue;
+        }
+        if x > 0 {
+            queue.push_back((x - 1, y));
+        }
+        if x + 1 < frame.width() {
+            queue.push_back((x + 1, y));
+        }
+        if y > 0 {
+            queue.push_back((x, y - 1));
+        }
+        if y + 1 < frame.height() {
+            queue.push_back((x, y + 1));
+        }
     }
-    if !manifest_exists || !sheet_exists {
-        let missing = if manifest_exists {
-            "spritesheet.webp"
-        } else {
-            "pet.json"
-        };
-        return Err(WhiteCatError::new(format!(
-            "White Cat runtime build is incomplete: missing {missing}"
-        )));
-    }
+    ensure(
+        reached.len() == occupied.len(),
+        format!(
+            "silhouette has disconnected occupancy: reached {} of {} pixels",
+            reached.len(),
+            occupied.len()
+        ),
+    )
+}
 
-    let manifest = load_manifest(&manifest_path)?;
-    validate_manifest(&manifest)?;
-    validate_webp_container(&sheet_path)?;
-    let sheet = load_sheet(&sheet_path)?;
-    let frames = extract_fixed_frames(&sheet)?;
-    validate_frames(&frames)?;
-    validate_vertical_stability(&frames)?;
-
-    if check_sources {
-        validate_fixed_placement_sources(project)?;
-        let expected = build_frames()?;
-        require(
-            frames == expected,
-            "checked-in spritesheet differs from the authored Rust pixel maps",
+pub fn validate_frame(frame: &RgbaImage) -> Result<()> {
+    ensure(
+        frame.dimensions() == (FRAME_WIDTH, FRAME_HEIGHT),
+        format!(
+            "canonical frame is {}x{}, expected {FRAME_WIDTH}x{FRAME_HEIGHT}",
+            frame.width(),
+            frame.height()
+        ),
+    )?;
+    let (min_x, min_y, max_x, max_y) = alpha_bounds(frame)
+        .ok_or_else(|| crate::error::WhiteCatError::new("canonical frame is empty"))?;
+    ensure(
+        min_x >= FRAME_MARGIN && min_y >= FRAME_MARGIN,
+        format!("frame begins at ({min_x},{min_y}), inside the {FRAME_MARGIN}px guard"),
+    )?;
+    ensure(
+        max_x + FRAME_MARGIN < FRAME_WIDTH,
+        format!("frame ends at x={max_x}, outside the production guard"),
+    )?;
+    ensure(
+        max_y == LAST_PLANTED_Y,
+        format!("last planted pixel is y={max_y}, expected {LAST_PLANTED_Y}"),
+    )?;
+    ensure(
+        (176..=182).contains(&(max_x - min_x + 1)),
+        format!(
+            "concept silhouette width {} is outside the faithful pixel range",
+            max_x - min_x + 1
+        ),
+    )?;
+    ensure(
+        (176..=182).contains(&(max_y - min_y + 1)),
+        format!(
+            "concept silhouette height {} is outside the faithful pixel range",
+            max_y - min_y + 1
+        ),
+    )?;
+    ensure(
+        frame
+            .enumerate_pixels()
+            .all(|(_, y, pixel)| y <= LAST_PLANTED_Y || pixel[3] == 0),
+        "pixels extend below the grounded boundary",
+    )?;
+    ensure(
+        frame
+            .enumerate_pixels()
+            .filter(|(_, _, pixel)| pixel[3] > 0 && pixel[3] < 255)
+            .count()
+            > 100,
+        "canonical frame has no meaningful antialiased edge coverage",
+    )?;
+    let eye_pixels = frame
+        .pixels()
+        .filter(|pixel| pixel[3] > 180 && color_distance(&pixel.0, EYE) < 500)
+        .count();
+    ensure(
+        (40..=90).contains(&eye_pixels),
+        format!("single concept eye area is {eye_pixels} pixels"),
+    )?;
+    for (name, color, minimum) in [
+        ("outline", OUTLINE, 500usize),
+        ("fur", FUR, 4_000usize),
+        ("shadow", SHADOW, 100usize),
+    ] {
+        let count = frame
+            .pixels()
+            .filter(|pixel| pixel[3] > 180 && color_distance(&pixel.0, color) < 500)
+            .count();
+        ensure(
+            count >= minimum,
+            format!("concept {name} color has only {count} anchored pixels"),
         )?;
+    }
+    ensure(
+        (0..FRAME_WIDTH)
+            .filter(|x| frame.get_pixel(*x, LAST_PLANTED_Y)[3] > 8)
+            .count()
+            >= 100,
+        "ground contact is too narrow",
+    )?;
+    validate_concept_cell_centers(frame)?;
+    validate_connected_silhouette(frame)
+}
+
+pub fn validate_manifest(manifest: &PetManifest) -> Result<()> {
+    ensure(
+        manifest.id == PET_ID,
+        format!("manifest id is {}", manifest.id),
+    )?;
+    ensure(
+        manifest.spritesheet_path == SHEET_FILE,
+        "manifest spritesheetPath is not spritesheet.webp",
+    )?;
+    ensure(
+        manifest.frame.width == FRAME_WIDTH
+            && manifest.frame.height == FRAME_HEIGHT
+            && manifest.frame.columns == GRID_COLUMNS
+            && manifest.frame.rows == GRID_ROWS,
+        "manifest frame geometry does not match the 192x208, 8x9 contract",
+    )?;
+    ensure(
+        manifest.frame_allocation.len() == STATES.len(),
+        "manifest frame allocation count is unstable",
+    )?;
+    for state in STATES {
+        let allocation = manifest.frame_allocation.get(state.name).ok_or_else(|| {
+            crate::error::WhiteCatError::new(format!("missing state {}", state.name))
+        })?;
+        ensure(
+            allocation.start == state.start && allocation.end == state.end,
+            format!("state {} has incorrect allocation", state.name),
+        )?;
+        let animation = manifest.animations.get(state.name).ok_or_else(|| {
+            crate::error::WhiteCatError::new(format!("missing animation {}", state.name))
+        })?;
+        ensure(
+            animation.frames == [state.start]
+                && animation.fps == 1
+                && animation.loops == state.loops
+                && animation.fallback == "idle",
+            format!("state {} is not an explicit static held pose", state.name),
+        )?;
+    }
+    for (alias, target) in ALIASES {
+        let expected = state_named(target).expect("known alias target");
+        let animation = manifest.animations.get(alias).ok_or_else(|| {
+            crate::error::WhiteCatError::new(format!("missing alias animation {alias}"))
+        })?;
+        ensure(
+            animation.frames == [expected.start]
+                && animation.fps == 1
+                && animation.fallback == "idle",
+            format!("alias {alias} does not hold the {target} pose"),
+        )?;
+    }
+    ensure(
+        manifest.animations.len() == STATES.len() + ALIASES.len(),
+        "manifest contains an unexpected animation state",
+    )
+}
+
+fn validate_reviews(project: &Path, frame: &RgbaImage) -> Result<()> {
+    let review = project.join(REVIEW_DIRECTORY);
+    let dark = image::open(review.join(DARK_REVIEW_FILE))?.to_rgba8();
+    let light = image::open(review.join(LIGHT_REVIEW_FILE))?.to_rgba8();
+    let exact = image::open(review.join(EXACT_REVIEW_FILE))?.to_rgba8();
+    let source = image::open(review.join(SOURCE_REVIEW_FILE))?.to_rgba8();
+    let silhouette = image::open(review.join(SILHOUETTE_REVIEW_FILE))?.to_rgba8();
+
+    ensure(
+        dark.dimensions() == (LARGE_REVIEW_WIDTH, LARGE_REVIEW_HEIGHT)
+            && light.dimensions() == (LARGE_REVIEW_WIDTH, LARGE_REVIEW_HEIGHT),
+        "dark/light prompt reviews have incorrect dimensions",
+    )?;
+    ensure(
+        exact.dimensions() == (EXACT_REVIEW_WIDTH, EXACT_REVIEW_HEIGHT),
+        "70x15 review does not have exact terminal-cell geometry",
+    )?;
+    ensure(
+        source.dimensions() == (kitten::SOURCE_WIDTH, kitten::SOURCE_HEIGHT),
+        "source review is not the canonical 4x render",
+    )?;
+    ensure(
+        silhouette.dimensions() == source.dimensions(),
+        "silhouette review does not match source dimensions",
+    )?;
+    ensure(
+        source.as_raw() == kitten::render_source().as_raw(),
+        "source review differs from the canonical authored render",
+    )?;
+    ensure(
+        silhouette.as_raw() == kitten::render_silhouette_source().as_raw(),
+        "silhouette review differs from the canonical occupancy mask",
+    )?;
+    ensure(
+        dark.as_raw() == artwork::dark_review(frame).as_raw()
+            && light.as_raw() == artwork::light_review(frame).as_raw()
+            && exact.as_raw() == artwork::exact_70x15_review(frame).as_raw(),
+        "prompt review artifacts are stale or nondeterministic",
+    )?;
+    Ok(())
+}
+
+fn validate_sources(project: &Path) -> Result<()> {
+    ensure(
+        project.join("src/kitten.rs").is_file(),
+        "canonical art source src/kitten.rs is missing",
+    )?;
+    ensure(
+        !project.join("src/maps.rs").exists(),
+        "rejected map audition remains connected to production",
+    )?;
+    let reference_path = project.join(kitten::CONCEPT_REFERENCE_FILE);
+    ensure(
+        reference_path.is_file(),
+        format!(
+            "approved concept reference is missing: {}",
+            reference_path.display()
+        ),
+    )?;
+    let reference = image::open(&reference_path)?;
+    ensure(
+        reference.width() == 1448 && reference.height() == 1086,
+        format!(
+            "approved concept reference is {}x{}, expected 1448x1086",
+            reference.width(),
+            reference.height()
+        ),
+    )?;
+    let source = fs::read_to_string(project.join("src/kitten.rs"))?;
+    ensure(
+        source.contains("SOURCE_SCALE: u32 = 4")
+            && source.contains("Lanczos3")
+            && source.contains("pub const CANONICAL_MAP")
+            && source.contains(kitten::CONCEPT_REFERENCE_SHA256)
+            && !source.contains("smooth_shape")
+            && !source.contains("CubicCurve"),
+        "canonical source does not declare the concept-faithful pixel pipeline",
+    )
+}
+
+pub fn validate_project(project: &Path, check_sources: bool) -> Result<()> {
+    ensure(
+        project.join(MANIFEST_FILE).is_file(),
+        format!("{} is missing", project.join(MANIFEST_FILE).display()),
+    )?;
+    ensure(
+        project.join(SHEET_FILE).is_file(),
+        format!("{} is missing", project.join(SHEET_FILE).display()),
+    )?;
+    let manifest = manifest::read_manifest(project)?;
+    validate_manifest(&manifest)?;
+    sheet::validate_lossless_static_webp(&project.join(SHEET_FILE))?;
+    let packed = sheet::load_rgba(&project.join(SHEET_FILE))?;
+    ensure(
+        packed.dimensions() == (SHEET_WIDTH, SHEET_HEIGHT),
+        format!(
+            "sheet is {}x{}, expected {SHEET_WIDTH}x{SHEET_HEIGHT}",
+            packed.width(),
+            packed.height()
+        ),
+    )?;
+    let canonical = kitten::render_frame();
+    validate_frame(&canonical)?;
+    for index in 0..FRAME_COUNT {
+        let frame = sheet::extract_frame(&packed, index)?;
+        ensure(
+            frame.as_raw() == canonical.as_raw(),
+            format!("runtime frame {index} is not the canonical held pose"),
+        )?;
+    }
+    if check_sources {
+        validate_sources(project)?;
+        validate_reviews(project, &canonical)?;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use tempfile::TempDir;
-
     use super::*;
-    use crate::manifest::{build_manifest, write_manifest};
-    use crate::sheet::{pack_fixed_frames, save_lossless_sheet};
 
-    fn fixture_frames() -> Vec<RgbaImage> {
-        let jumping = ANIMATION_RANGES[4];
-        (0..FRAME_COUNT)
-            .map(|index| {
-                let mut frame = RgbaImage::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32);
-                let mut bottom = GROUND_PIXEL_Y;
-                if jumping.start + 2 <= index && index < jumping.end - 1 {
-                    bottom -= 30;
-                }
-                for y in bottom - 23..=bottom {
-                    for x in 80..=111 {
-                        frame.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
-                    }
-                }
-                frame
-            })
-            .collect()
-    }
-
-    fn fixture_project() -> TempDir {
-        let directory = tempfile::tempdir().unwrap();
-        write_manifest(
-            &build_manifest("Geometry-only test fixture"),
-            &directory.path().join("pet.json"),
-        )
-        .unwrap();
-        let sheet = pack_fixed_frames(&fixture_frames()).unwrap();
-        save_lossless_sheet(&sheet, &directory.path().join("spritesheet.webp")).unwrap();
-        directory
+    #[test]
+    fn canonical_frame_meets_production_geometry() {
+        validate_frame(&kitten::render_frame()).expect("canonical frame is production-valid");
     }
 
     #[test]
-    fn temporary_geometry_fixture_validates() {
-        let fixture = fixture_project();
-        validate_project(fixture.path(), false).unwrap();
+    fn canonical_manifest_is_explicit_and_static() {
+        validate_manifest(&manifest::build_manifest()).expect("manifest is valid");
     }
 
     #[test]
-    fn missing_runtime_has_a_clear_error() {
-        let fixture = tempfile::tempdir().unwrap();
-        assert_eq!(
-            validate_project(fixture.path(), false)
-                .unwrap_err()
-                .to_string(),
-            "No White Cat runtime assets have been built"
-        );
-    }
-
-    #[test]
-    fn geometry_mismatch_is_rejected() {
-        let fixture = fixture_project();
-        let path = fixture.path().join("pet.json");
-        let mut manifest = load_manifest(&path).unwrap();
-        manifest.frame.height -= 1;
-        write_manifest(&manifest, &path).unwrap();
-        assert!(
-            validate_project(fixture.path(), false)
-                .unwrap_err()
-                .to_string()
-                .contains("frame geometry")
-        );
-    }
-
-    #[test]
-    fn every_grounded_frame_uses_the_canonical_baseline() {
-        let frames = fixture_frames();
-        let records = validate_vertical_stability(&frames).unwrap();
-        for animation in GROUNDED_ANIMATIONS {
-            let range = ANIMATION_RANGES
-                .iter()
-                .find(|range| range.name == animation)
-                .unwrap();
-            assert!(
-                records[range.start..=range.end]
-                    .iter()
-                    .all(|record| record.bounds.bottom() == GROUND_PIXEL_Y)
+    fn full_sheet_is_one_honest_held_pose() {
+        let frame = kitten::render_frame();
+        let packed = sheet::pack_fixed_frames(&vec![frame.clone(); FRAME_COUNT]).expect("pack");
+        for index in 0..FRAME_COUNT {
+            assert_eq!(
+                sheet::extract_frame(&packed, index)
+                    .expect("extract")
+                    .as_raw(),
+                frame.as_raw()
             );
         }
-    }
-
-    #[test]
-    fn source_audit_rejects_content_resizing() {
-        let project = tempfile::tempdir().unwrap();
-        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let target_root = project.path().join("src");
-        fs::create_dir(&target_root).unwrap();
-        for name in ["sheet.rs", "artwork.rs", "maps.rs"] {
-            fs::copy(source_root.join(name), target_root.join(name)).unwrap();
-        }
-        let sheet_path = target_root.join("sheet.rs");
-        let mut source = fs::read_to_string(&sheet_path).unwrap();
-        source.push_str("\nfn forbidden() { resize(); }\n");
-        fs::write(&sheet_path, source).unwrap();
-        assert!(
-            validate_fixed_placement_sources(project.path())
-                .unwrap_err()
-                .to_string()
-                .contains("content normalization")
-        );
     }
 }

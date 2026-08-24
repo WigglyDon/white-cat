@@ -1,209 +1,71 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
+use white_cat::artwork;
 use white_cat::contract::{
-    FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, PIXEL_SCALE, SHEET_HEIGHT, SHEET_WIDTH, SOURCE_HEIGHT,
-    SOURCE_WIDTH,
+    EXACT_REVIEW_COLUMNS, EXACT_REVIEW_ROWS, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, GRID_COLUMNS,
+    GRID_ROWS, PET_ID, PET_SELECTOR, SHEET_HEIGHT, SHEET_WIDTH,
 };
-use white_cat::install::install_pet;
-use white_cat::manifest::generate;
-use white_cat::maps::AUDITION_CANDIDATES;
-use white_cat::preview::{render_plain, run_live, run_preview};
-use white_cat::validate::validate_project;
-use white_cat::{Result, WhiteCatError};
+use white_cat::error::{Result, fail};
+use white_cat::{install, preview, validate};
 
-fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn usage() {
-    eprintln!(
-        "White Cat pure-Rust toolchain\n\n\
-         usage:\n\
-         white-cat                    launch live viewer (default)\n\
-         white-cat [<command>] [options]\n\n\
-         commands:\n\
-           status                         show scaffold/runtime state\n\
-           preview [--state S] [--frame N] [--plain]\n\
-           live [--candidate N] [--source PATH]\n\
-           generate [--project-dir PATH]\n\
-           validate [--project-dir PATH] [--no-source-check]\n\
-           install [--project-dir PATH] [--force]"
-    );
-}
-
-fn value_after(args: &[String], index: &mut usize, option: &str) -> Result<String> {
-    *index += 1;
-    args.get(*index)
-        .cloned()
-        .ok_or_else(|| WhiteCatError::new(format!("{option} requires a value")))
-}
-
-fn parse_project_dir(args: &[String], allow_force: bool) -> Result<(PathBuf, bool, bool)> {
-    let mut project = project_root();
-    let mut force = false;
-    let mut no_source_check = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--project-dir" => {
-                project = PathBuf::from(value_after(args, &mut index, "--project-dir")?)
-            }
-            "--force" if allow_force => force = true,
-            "--no-source-check" if !allow_force => no_source_check = true,
-            option => return Err(WhiteCatError::new(format!("unknown option {option:?}"))),
-        }
-        index += 1;
-    }
-    Ok((project, force, no_source_check))
-}
-
-fn command_status() {
-    let root = project_root();
-    let manifest = root.join("pet.json").is_file();
-    let sheet = root.join("spritesheet.webp").is_file();
-    println!("White Cat implementation: pure Rust");
-    println!("White Cat design: approved simplified pixel-map concept");
-    println!(
-        "White Cat runtime assets: {}",
-        match (manifest, sheet) {
-            (true, true) => "built",
-            (false, false) => "not built",
-            _ => "incomplete",
-        }
-    );
-    println!(
-        "White Cat source: {SOURCE_WIDTH}x{SOURCE_HEIGHT} Rust string arrays at fixed {PIXEL_SCALE}x scale"
-    );
-    println!(
-        "White Cat live audition: {} candidates with 8 idle variations each",
-        AUDITION_CANDIDATES.len()
-    );
-}
-
-fn command_live(args: &[String]) -> Result<()> {
-    let mut source = project_root().join("src/maps.rs");
-    let mut candidate = 1_usize;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--source" => source = PathBuf::from(value_after(args, &mut index, "--source")?),
-            "--candidate" => {
-                let value = value_after(args, &mut index, "--candidate")?;
-                candidate = value.parse().map_err(|_| {
-                    WhiteCatError::new(format!("--candidate must be an integer: {value}"))
-                })?;
-                if !(1..=AUDITION_CANDIDATES.len()).contains(&candidate) {
-                    return Err(WhiteCatError::new(format!(
-                        "--candidate must be between 1 and {}",
-                        AUDITION_CANDIDATES.len()
-                    )));
-                }
-            }
-            option => return Err(WhiteCatError::new(format!("unknown option {option:?}"))),
-        }
-        index += 1;
-    }
-    run_live(&source, candidate - 1)
-}
-
-fn command_preview(args: &[String]) -> Result<()> {
-    let mut source = project_root().join("src/maps.rs");
-    let mut state = "idle".to_owned();
-    let mut frame = 0_usize;
-    let mut plain = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--source" => source = PathBuf::from(value_after(args, &mut index, "--source")?),
-            "--state" => state = value_after(args, &mut index, "--state")?,
-            "--frame" => {
-                let value = value_after(args, &mut index, "--frame")?;
-                frame = value.parse().map_err(|_| {
-                    WhiteCatError::new(format!("--frame must be a non-negative integer: {value}"))
-                })?;
-            }
-            "--plain" => plain = true,
-            option => return Err(WhiteCatError::new(format!("unknown option {option:?}"))),
-        }
-        index += 1;
-    }
-
-    if plain {
-        let artwork = white_cat::artwork::load_maps_source(&source)?;
-        let rendered = render_plain(&artwork, &state, frame)?;
-        println!("{rendered}");
-        Ok(())
-    } else {
-        run_preview(&source, &state, frame)
-    }
+fn project_root() -> Result<PathBuf> {
+    env::current_dir().map_err(Into::into)
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let Some(command) = args.first().map(String::as_str) else {
-        return command_live(&[]);
-    };
-    if command.starts_with("--") {
-        return command_live(&args);
-    }
-    let options = &args[1..];
-    match command {
+    let mut arguments = env::args().skip(1);
+    let command = arguments.next().unwrap_or_else(|| "preview".to_owned());
+    let project = project_root()?;
+    match command.as_str() {
         "status" => {
-            if !options.is_empty() {
-                return Err(WhiteCatError::new("status takes no options"));
-            }
-            command_status();
-            Ok(())
-        }
-        "preview" => command_preview(options),
-        "live" | "l" => command_live(options),
-        "generate" => {
-            let (project, _, _) = parse_project_dir(options, false)?;
-            let (manifest, sheet) = generate(&project)?;
-            println!("Generated {}", manifest.display());
-            println!("Generated {}", sheet.display());
+            println!("id: {PET_ID}");
+            println!("selector: {PET_SELECTOR}");
+            println!("frame: {FRAME_WIDTH}x{FRAME_HEIGHT}");
             println!(
-                "Source {SOURCE_WIDTH}x{SOURCE_HEIGHT}; scale {PIXEL_SCALE}x nearest; runtime {FRAME_WIDTH}x{FRAME_HEIGHT}; frames {FRAME_COUNT}"
+                "sheet: {SHEET_WIDTH}x{SHEET_HEIGHT} ({GRID_COLUMNS}x{GRID_ROWS}, {FRAME_COUNT} held frames)"
             );
-            Ok(())
+            println!("exact review: {EXACT_REVIEW_COLUMNS}x{EXACT_REVIEW_ROWS}");
+            println!("art source: src/kitten.rs");
+            println!("visual authority: concept_design_of_pixel_art_cat.png");
+        }
+        "generate" => {
+            let generated = artwork::generate_project(&project)?;
+            println!("generated {}", generated.manifest.display());
+            println!("generated {}", generated.sheet.display());
+            for review in generated.reviews {
+                println!("generated {}", review.display());
+            }
         }
         "validate" => {
-            let (project, _, no_source_check) = parse_project_dir(options, false)?;
-            validate_project(&project, !no_source_check)?;
-            println!(
-                "Validated {FRAME_COUNT} fixed RGBA frames; sheet {SHEET_WIDTH}x{SHEET_HEIGHT}"
-            );
-            Ok(())
+            validate::validate_project(&project, true)?;
+            println!("White Cat production assets are valid");
+        }
+        "preview" | "live" | "review" => {
+            artwork::generate_project(&project)?;
+            validate::validate_project(&project, true)?;
+            preview::run(&project)?;
         }
         "install" => {
-            let (project, force, _) = parse_project_dir(options, true)?;
-            let outcome = install_pet(&project, force)?;
+            let force = arguments.any(|argument| argument == "--force");
+            let outcome = install::install_pet(&project, force)?;
+            println!("installed: {}", outcome.target.display());
             if let Some(backup) = outcome.backup {
-                println!("Previous installation backed up to: {}", backup.display());
+                println!("backup: {}", backup.display());
             }
-            println!("Installed White Cat to: {}", outcome.target.display());
-            println!("Select White Cat from /pets; config.toml was not modified.");
-            Ok(())
         }
-        "help" | "--help" | "-h" => {
-            usage();
-            Ok(())
-        }
-        other => {
-            usage();
-            Err(WhiteCatError::new(format!("unknown command {other:?}")))
+        _ => {
+            return fail(format!(
+                "unknown command {command:?}; use status, generate, validate, preview, or install [--force]"
+            ));
         }
     }
+    Ok(())
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("White Cat failed: {error}");
-            ExitCode::FAILURE
-        }
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("White Cat failed: {error}");
+        std::process::exit(1);
     }
 }
