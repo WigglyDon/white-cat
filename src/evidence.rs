@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use image::{Rgba, RgbaImage};
 
 use crate::artwork;
-use crate::contract::{FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, MANIFEST_FILE, SHEET_FILE};
+use crate::contract::{
+    FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, GRID_COLUMNS, MANIFEST_FILE, SHEET_FILE, STATES,
+    animation_fps, animation_timeline,
+};
 use crate::digest::sha256_hex;
 use crate::error::{Result, WhiteCatError, fail};
 use crate::kitten;
@@ -25,6 +28,9 @@ pub const HASH_FILE: &str = "source-runtime-sheet-hashes.tsv";
 pub const BLOCK_REPORT_FILE: &str = "block-uniformity.tsv";
 pub const MISMATCH_REPORT_FILE: &str = "mismatch-coordinates.tsv";
 pub const VALIDATION_REPORT_FILE: &str = "validation-summary.tsv";
+pub const ANIMATION_CONTRACT_FILE: &str = "frozen-animation-contract.txt";
+pub const FRAME_PLAN_FILE: &str = "frame-plan.tsv";
+pub const STATE_TIMING_FILE: &str = "state-timing.tsv";
 pub const DETERMINISM_REPORT_FILE: &str = "deterministic-generation.tsv";
 pub const INSTALLED_REPORT_FILE: &str = "generated-versus-installed.tsv";
 pub const OBSERVED_FRAME_FILE: &str = "fresh-codex-cache-frame.png";
@@ -89,6 +95,7 @@ fn palette_manifest() -> String {
 }
 
 fn hash_manifest(report: &ValidationReport) -> String {
+    let animation_contract = kitten::frozen_animation_contract_text();
     format!(
         concat!(
             "payload\tbytes\tsha256\n",
@@ -96,14 +103,52 @@ fn hash_manifest(report: &ValidationReport) -> String {
             "contiguous_symbols\t624\t{}\n",
             "logical_rgba\t2496\t{}\n",
             "runtime_rgba\t159744\t{}\n",
-            "decoded_sheet_rgba\t11501568\t{}\n"
+            "decoded_sheet_rgba\t11501568\t{}\n",
+            "frozen_animation_contract\t{}\t{}\n"
         ),
         report.normalized_matrix_sha256,
         report.contiguous_symbol_sha256,
         report.logical_rgba_sha256,
         report.runtime_rgba_sha256,
         report.sheet_rgba_sha256,
+        animation_contract.len(),
+        sha256_hex(animation_contract.as_bytes()),
     )
+}
+
+fn frame_plan_manifest() -> String {
+    let frames = kitten::build_frames();
+    let mut text = String::from("frame\tstate\tpose\trgba_sha256\n");
+    for (index, frame) in frames.iter().enumerate() {
+        let row = index / GRID_COLUMNS as usize;
+        let pose = kitten::FRAME_POSES[row][index % GRID_COLUMNS as usize];
+        text.push_str(&format!(
+            "{index}\t{}\t{}\t{}\n",
+            STATES[row].name,
+            kitten::pose_name(pose),
+            sha256_hex(frame.as_raw())
+        ));
+    }
+    text
+}
+
+fn state_timing_manifest() -> String {
+    let mut text = String::from("state\tfps\tloop\tframes\n");
+    for state in STATES {
+        let frames = animation_timeline(state.name)
+            .expect("declared timeline")
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{frames}\n",
+            state.name,
+            animation_fps(state.name).expect("declared fps"),
+            state.loops,
+        ));
+    }
+    text
 }
 
 fn block_report(frame: &RgbaImage) -> String {
@@ -147,7 +192,7 @@ fn mismatch_report(report: &ValidationReport) -> String {
             "SUMMARY_illegal_source_symbols\t{}\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
             "SUMMARY_illegal_runtime_colors\t{}\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
             "SUMMARY_alpha_violations\t{}\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n",
-            "SUMMARY_frame_to_frame_mismatches\t{}\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n"
+            "SUMMARY_frame_contract_mismatches\t{}\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\n"
         ),
         report.source_mismatches,
         report.runtime_mismatches,
@@ -156,7 +201,7 @@ fn mismatch_report(report: &ValidationReport) -> String {
         report.illegal_source_symbols,
         report.illegal_runtime_colors,
         report.alpha_violations,
-        report.frame_to_frame_mismatches,
+        report.frame_contract_mismatches,
     )
 }
 
@@ -214,6 +259,18 @@ fn core_artifacts(
             PathBuf::from(VALIDATION_REPORT_FILE),
             report.summary_tsv().into_bytes(),
         ),
+        (
+            PathBuf::from(ANIMATION_CONTRACT_FILE),
+            kitten::frozen_animation_contract_text().into_bytes(),
+        ),
+        (
+            PathBuf::from(FRAME_PLAN_FILE),
+            frame_plan_manifest().into_bytes(),
+        ),
+        (
+            PathBuf::from(STATE_TIMING_FILE),
+            state_timing_manifest().into_bytes(),
+        ),
     ])
 }
 
@@ -235,6 +292,9 @@ pub fn generation_relative_paths() -> Vec<PathBuf> {
             BLOCK_REPORT_FILE,
             MISMATCH_REPORT_FILE,
             VALIDATION_REPORT_FILE,
+            ANIMATION_CONTRACT_FILE,
+            FRAME_PLAN_FILE,
+            STATE_TIMING_FILE,
         ]
         .into_iter()
         .map(|name| PathBuf::from(EVIDENCE_DIRECTORY).join(name)),
@@ -500,16 +560,17 @@ pub fn compare_observed_frame(project: &Path, observed_path: &Path) -> Result<()
 }
 
 pub fn compare_cache_directory(project: &Path, frames_directory: &Path) -> Result<()> {
-    let canonical = kitten::render_frame();
-    let mut report =
-        String::from("frame\tfile\tfile_sha256\trgba_sha256\twidth\theight\tpixel_mismatches\n");
+    let expected_frames = kitten::build_frames();
+    let mut report = String::from(
+        "frame\tstate\tpose\tfile\tfile_sha256\trgba_sha256\twidth\theight\tpixel_mismatches\n",
+    );
     let mut total = 0usize;
-    for index in 0..FRAME_COUNT {
+    for (index, expected) in expected_frames.iter().enumerate().take(FRAME_COUNT) {
         let path = frames_directory.join(format!("frame_{index:03}.png"));
         let bytes = fs::read(&path)?;
         let frame = image::load_from_memory(&bytes)?.to_rgba8();
         let mismatches = if frame.dimensions() == (FRAME_WIDTH, FRAME_HEIGHT) {
-            canonical
+            expected
                 .pixels()
                 .zip(frame.pixels())
                 .filter(|(expected, actual)| expected != actual)
@@ -518,8 +579,12 @@ pub fn compare_cache_directory(project: &Path, frames_directory: &Path) -> Resul
             (FRAME_WIDTH * FRAME_HEIGHT) as usize
         };
         total += mismatches;
+        let row = index / GRID_COLUMNS as usize;
+        let pose = kitten::FRAME_POSES[row][index % GRID_COLUMNS as usize];
         report.push_str(&format!(
-            "{index}\t{}\t{}\t{}\t{}\t{}\t{mismatches}\n",
+            "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{mismatches}\n",
+            STATES[row].name,
+            kitten::pose_name(pose),
             path.display(),
             sha256_hex(&bytes),
             sha256_hex(frame.as_raw()),
@@ -535,7 +600,7 @@ pub fn compare_cache_directory(project: &Path, frames_directory: &Path) -> Resul
         total += png_count.abs_diff(FRAME_COUNT);
     }
     report.push_str(&format!(
-        "TOTAL\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\t{total}\n"
+        "TOTAL\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\tNOT_APPLICABLE\t{total}\n"
     ));
     let directory = project.join(EVIDENCE_DIRECTORY);
     sheet::write_atomic(&directory.join(CACHE_FRAMES_REPORT_FILE), report.as_bytes())?;

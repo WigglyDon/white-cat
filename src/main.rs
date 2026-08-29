@@ -23,11 +23,11 @@ fn run() -> Result<()> {
             println!("selector: {PET_SELECTOR}");
             println!("frame: {FRAME_WIDTH}x{FRAME_HEIGHT}");
             println!(
-                "sheet: {SHEET_WIDTH}x{SHEET_HEIGHT} ({GRID_COLUMNS}x{GRID_ROWS}, {FRAME_COUNT} held frames)"
+                "sheet: {SHEET_WIDTH}x{SHEET_HEIGHT} ({GRID_COLUMNS}x{GRID_ROWS}, {FRAME_COUNT} animated cells)"
             );
             println!("exact review: {EXACT_REVIEW_COLUMNS}x{EXACT_REVIEW_ROWS}");
             println!("art source: src/kitten.rs");
-            println!("art authority: frozen CANONICAL_MAP");
+            println!("art authority: frozen literal pose maps and frame plan");
             println!(
                 "source SHA-256: {}",
                 white_cat::kitten::NORMALIZED_MATRIX_SHA256
@@ -35,6 +35,10 @@ fn run() -> Result<()> {
             println!(
                 "runtime RGBA SHA-256: {}",
                 white_cat::kitten::RUNTIME_RGBA_SHA256
+            );
+            println!(
+                "animation contract SHA-256: {}",
+                white_cat::kitten::FROZEN_ANIMATION_CONTRACT_SHA256
             );
         }
         "generate" => {
@@ -78,7 +82,7 @@ fn run() -> Result<()> {
                 white_cat::error::WhiteCatError::new("compare-observed-frame requires a PNG path")
             })?;
             evidence::compare_observed_frame(&project, &PathBuf::from(observed))?;
-            println!("observed frame is pixel-identical to the canonical runtime frame");
+            println!("observed frame 0 is pixel-identical to the canonical runtime frame");
         }
         "compare-cache-directory" => {
             let frames = arguments.next().ok_or_else(|| {
@@ -87,7 +91,7 @@ fn run() -> Result<()> {
                 )
             })?;
             evidence::compare_cache_directory(&project, &PathBuf::from(frames))?;
-            println!("all fresh Codex cache frames are pixel-identical");
+            println!("all fresh Codex cache frames match their declared animation poses");
         }
         "record-runtime-capture" => {
             let capture = arguments.next().ok_or_else(|| {

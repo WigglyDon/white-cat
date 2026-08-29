@@ -5,8 +5,8 @@ use image::codecs::png::PngEncoder;
 use image::{ImageEncoder, Rgba, RgbaImage};
 
 use crate::contract::{
-    EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, MANIFEST_FILE, SHEET_FILE,
-    TERMINAL_CELL_HEIGHT, TERMINAL_CELL_WIDTH,
+    EXACT_REVIEW_HEIGHT, EXACT_REVIEW_WIDTH, FRAME_COUNT, FRAME_HEIGHT, FRAME_WIDTH, GRID_COLUMNS,
+    MANIFEST_FILE, SHEET_FILE, TERMINAL_CELL_HEIGHT, TERMINAL_CELL_WIDTH,
 };
 use crate::error::Result;
 use crate::evidence;
@@ -20,6 +20,8 @@ pub const LIGHT_REVIEW_FILE: &str = "approved-pixel-cat-light.png";
 pub const EXACT_REVIEW_FILE: &str = "approved-pixel-cat-70x15.png";
 pub const SOURCE_REVIEW_FILE: &str = "approved-pixel-cat-source.png";
 pub const SILHOUETTE_REVIEW_FILE: &str = "approved-pixel-cat-silhouette.png";
+pub const ANIMATION_STORYBOARD_FILE: &str = "approved-animation-storyboard.png";
+pub const IDLE_STRIP_FILE: &str = "approved-idle-strip.png";
 pub const LARGE_REVIEW_WIDTH: u32 = 960;
 pub const LARGE_REVIEW_HEIGHT: u32 = 320;
 
@@ -46,7 +48,7 @@ impl ReviewMode {
 pub struct GeneratedAssets {
     pub manifest: PathBuf,
     pub sheet: PathBuf,
-    pub reviews: [PathBuf; 5],
+    pub reviews: Vec<PathBuf>,
     pub evidence: Vec<PathBuf>,
 }
 
@@ -57,6 +59,8 @@ pub fn review_relative_paths() -> Vec<PathBuf> {
         EXACT_REVIEW_FILE,
         SOURCE_REVIEW_FILE,
         SILHOUETTE_REVIEW_FILE,
+        ANIMATION_STORYBOARD_FILE,
+        IDLE_STRIP_FILE,
     ]
     .into_iter()
     .map(|name| PathBuf::from(REVIEW_DIRECTORY).join(name))
@@ -97,6 +101,28 @@ fn overlay_opaque(destination: &mut RgbaImage, source: &RgbaImage, x: u32, y: u3
             target[3] = 255;
         }
     }
+}
+
+pub fn solid_animation_storyboard(packed: &RgbaImage) -> RgbaImage {
+    let mut canvas =
+        RgbaImage::from_pixel(packed.width(), packed.height(), Rgba([13, 17, 22, 255]));
+    overlay_opaque(&mut canvas, packed, 0, 0);
+    canvas
+}
+
+pub fn solid_idle_strip(frames: &[RgbaImage]) -> Result<RgbaImage> {
+    if frames.len() < GRID_COLUMNS as usize {
+        return crate::error::fail("idle strip requires the first eight animation frames");
+    }
+    let mut strip = RgbaImage::from_pixel(
+        FRAME_WIDTH * GRID_COLUMNS,
+        FRAME_HEIGHT,
+        Rgba([13, 17, 22, 255]),
+    );
+    for (index, frame) in frames.iter().take(GRID_COLUMNS as usize).enumerate() {
+        overlay_opaque(&mut strip, frame, index as u32 * FRAME_WIDTH, 0);
+    }
+    Ok(strip)
 }
 
 fn prompt_canvas(frame: &RgbaImage, width: u32, height: u32, dark: bool) -> RgbaImage {
@@ -189,7 +215,15 @@ pub fn exact_70x15_review(frame: &RgbaImage) -> RgbaImage {
 fn inspection_canvas(frame: &RgbaImage, width: u32, height: u32, silhouette: bool) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(width, height, Rgba([16, 21, 27, 255]));
     let rendered = if silhouette {
-        crate::kitten::render_silhouette_frame()
+        let mut rendered = RgbaImage::new(frame.width(), frame.height());
+        for (target, original) in rendered.pixels_mut().zip(frame.pixels()) {
+            *target = if original[3] == 0 {
+                Rgba(crate::kitten::TRANSPARENT)
+            } else {
+                Rgba(crate::kitten::SILHOUETTE)
+            };
+        }
+        rendered
     } else {
         frame.clone()
     };
@@ -230,25 +264,35 @@ fn write_png(path: &Path, image: &RgbaImage) -> Result<()> {
 
 pub fn generate_project(project: &Path) -> Result<GeneratedAssets> {
     let frame = kitten::render_frame();
-    let frames = vec![frame.clone(); FRAME_COUNT];
+    let frames = kitten::build_frames();
+    if frames.len() != FRAME_COUNT {
+        return crate::error::fail(format!(
+            "animation contract built {} frames, expected {FRAME_COUNT}",
+            frames.len()
+        ));
+    }
     let packed = sheet::pack_fixed_frames(&frames)?;
     manifest::write_manifest(project)?;
     sheet::write_lossless_webp(&project.join(SHEET_FILE), &packed)?;
 
     let review_directory = project.join(REVIEW_DIRECTORY);
     fs::create_dir_all(&review_directory)?;
-    let reviews = [
+    let reviews = vec![
         review_directory.join(DARK_REVIEW_FILE),
         review_directory.join(LIGHT_REVIEW_FILE),
         review_directory.join(EXACT_REVIEW_FILE),
         review_directory.join(SOURCE_REVIEW_FILE),
         review_directory.join(SILHOUETTE_REVIEW_FILE),
+        review_directory.join(ANIMATION_STORYBOARD_FILE),
+        review_directory.join(IDLE_STRIP_FILE),
     ];
     write_png(&reviews[0], &dark_review(&frame))?;
     write_png(&reviews[1], &light_review(&frame))?;
     write_png(&reviews[2], &exact_70x15_review(&frame))?;
     write_png(&reviews[3], &kitten::render_logical())?;
     write_png(&reviews[4], &kitten::render_silhouette_logical())?;
+    write_png(&reviews[5], &solid_animation_storyboard(&packed))?;
+    write_png(&reviews[6], &solid_idle_strip(&frames)?)?;
 
     let decoded = sheet::load_rgba(&project.join(SHEET_FILE))?;
     let report = crate::validate::validate_packed(&decoded)?;

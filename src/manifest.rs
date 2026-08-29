@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{
     ALIASES, FRAME_HEIGHT, FRAME_WIDTH, GRID_COLUMNS, GRID_ROWS, MANIFEST_FILE, PET_ID, SHEET_FILE,
-    STATES, state_named,
+    STATES, animation_fps, animation_timeline, state_named,
 };
 use crate::error::Result;
 use crate::sheet::write_atomic;
@@ -46,10 +46,12 @@ pub struct Animation {
     pub fallback: String,
 }
 
-fn held_animation(frame: usize, loops: bool) -> Animation {
+fn animated_state(name: &str, loops: bool) -> Animation {
     Animation {
-        frames: vec![frame],
-        fps: 1,
+        frames: animation_timeline(name)
+            .expect("declared state has an animation timeline")
+            .to_vec(),
+        fps: animation_fps(name).expect("declared state has animation timing"),
         loops,
         fallback: "idle".to_owned(),
     }
@@ -68,18 +70,19 @@ pub fn build_manifest() -> PetManifest {
         );
         animations.insert(
             state.name.to_owned(),
-            held_animation(state.start, state.loops),
+            animated_state(state.name, state.loops),
         );
     }
     for (alias, target) in ALIASES {
         let target = state_named(target).expect("alias target is a declared state");
-        animations.insert(alias.to_owned(), held_animation(target.start, target.loops));
+        animations.insert(alias.to_owned(), animated_state(target.name, target.loops));
     }
 
     PetManifest {
         id: PET_ID.to_owned(),
         display_name: "White Cat".to_owned(),
-        description: "The frozen canonical White Cat base pose.".to_owned(),
+        description: "A quiet, watchful white terminal cat with responsive pixel animation."
+            .to_owned(),
         spritesheet_path: SHEET_FILE.to_owned(),
         frame: FrameGeometry {
             width: FRAME_WIDTH,
@@ -109,7 +112,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_runtime_states_hold_one_populated_frame() {
+    fn all_runtime_states_have_explicit_timed_sequences() {
         let manifest = build_manifest();
         assert_eq!(manifest.frame_allocation.len(), STATES.len());
         assert_eq!(manifest.animations.len(), STATES.len() + ALIASES.len());
@@ -117,7 +120,7 @@ mod tests {
             manifest
                 .animations
                 .values()
-                .all(|animation| animation.frames.len() == 1 && animation.fps == 1)
+                .all(|animation| animation.frames.len() >= 8 && animation.fps >= 8)
         );
     }
 }
